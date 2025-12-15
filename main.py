@@ -1,9 +1,7 @@
-import base64
 import json
 import os
 import datetime
 import pdfplumber
-
 from flask import Flask, request
 from google.cloud import storage, bigquery
 from vertexai import init
@@ -16,45 +14,47 @@ DATASET = "etl_reports"
 TABLE = "documents"
 
 
-############################################################
-# Move file to processed/
-############################################################
+###########################################################
+# MOVE FILE TO /processed/
+###########################################################
 def move_to_processed(bucket, file_path):
     new_path = file_path.replace("incoming/", "processed/")
     src = bucket.blob(file_path)
 
     if not src.exists():
-        print("⛔ File already moved or missing — skip move.")
+        print("⛔ File missing — skipping move")
         return None
 
-    print(f"📦 Moving → {new_path}")
     bucket.copy_blob(src, bucket, new_path)
     src.delete()
+
+    print(f"📦 File moved to {new_path}")
     return new_path
 
 
-############################################################
-# Extract text
-############################################################
+###########################################################
+# EXTRACT TEXT FROM PDF
+###########################################################
 def extract_text(local_path):
     try:
         with pdfplumber.open(local_path) as pdf:
-            pages = [(p.extract_text() or "") for p in pdf.pages]
+            pages = [page.extract_text() or "" for page in pdf.pages]
         return "\n".join(pages)
     except Exception as e:
-        print("❌ PDF read error:", e)
+        print("❌ PDF extraction failed:", e)
         return ""
 
 
-############################################################
-# Gemini
-############################################################
+###########################################################
+# GEMINI CALL
+###########################################################
 def call_gemini(text):
     init(project=os.environ["GOOGLE_CLOUD_PROJECT"], location="us-central1")
     model = GenerativeModel("gemini-2.5-flash")
 
     prompt = f"""
-Extract important information and return ONLY JSON.
+Extract structured information and return ONLY JSON:
+
 PDF TEXT:
 {text}
 """
@@ -64,20 +64,23 @@ PDF TEXT:
     try:
         return json.loads(response.text)
     except Exception:
-        print("⚠️ Gemini returned non-JSON")
+        print("⚠️ Gemini returned non-JSON output")
         return {
             "summary": "",
+            "key_points": [],
+            "extracted_fields": {},
+            "tables": [],
             "raw_text": text,
             "error": response.text,
         }
 
 
-############################################################
-# Insert into BigQuery
-############################################################
+###########################################################
+# INSERT INTO BIGQUERY
+###########################################################
 def insert_bigquery(client_id, filename, parsed):
-    client = bigquery.Client()
     table = f"{os.environ['GOOGLE_CLOUD_PROJECT']}.{DATASET}.{TABLE}"
+    client = bigquery.Client()
 
     row = {
         "client_id": client_id,
@@ -91,86 +94,79 @@ def insert_bigquery(client_id, filename, parsed):
         "raw_error": parsed.get("error"),
     }
 
-    err = client.insert_rows_json(table, [row])
-    if err:
-        print("❌ BigQuery insert error:", err)
+    errors = client.insert_rows_json(table, [row])
+    if errors:
+        print("❌ BigQuery insert error:", errors)
     else:
         print("✅ Inserted into BigQuery")
 
 
-############################################################
+###########################################################
 # MAIN ENTRY — Eventarc → Cloud Run → POST /
-############################################################
+###########################################################
 @app.post("/")
-def process_pdf():
-    payload = request.get_json(silent=True)
-    if not payload:
-        print("⚠️ No payload received")
+def handler():
+    envelope = request.get_json(silent=True)
+
+    if not envelope:
+        print("⚠️ No Eventarc envelope")
         return ("Ignored", 200)
 
-    # Eventarc payload structure
-    proto = payload.get("protoPayload", {})
-    resource = proto.get("resourceName", "")
+    # Eventarc Cloud Storage event format
+    event = envelope.get("data", {})
+    file_path = event.get("name")
 
-    if "/objects/" not in resource:
+    if not file_path:
         print("⚠️ Not a valid GCS event")
         return ("Ignored", 200)
 
-    file_path = resource.split("/objects/")[1]
-
-    print("================================")
+    print("=======================")
     print(f"📄 Triggered: {file_path}")
-    print("================================")
+    print("=======================")
 
-    # Skip folder triggers
+    # Ignore folder events
     if file_path.endswith("/"):
         print("⛔ Folder event — ignored")
         return ("OK", 200)
 
-    # Skip non-incoming
-    if "incoming/" not in file_path:
-        print("⛔ Not in incoming/ — ignored")
-        return ("OK", 200)
-
-    # Skip already processed
+    # Ignore processed files
     if "processed/" in file_path:
         print("⛔ Already processed — ignored")
         return ("OK", 200)
 
-    # Extract client id
+    # Must be incoming/
+    if "incoming/" not in file_path:
+        print("⛔ Not an incoming file — ignored")
+        return ("OK", 200)
+
+    # First part → client ID
     client_id = file_path.split("/")[0]
     print(f"👤 Client ID: {client_id}")
 
-    # Download file
     storage_client = storage.Client()
     bucket = storage_client.bucket(BUCKET_NAME)
     blob = bucket.blob(file_path)
 
     if not blob.exists():
-        print("⛔ File missing (likely already moved)")
+        print("⛔ File missing — skip")
         return ("OK", 200)
 
-    # Always use a file path NOT ending in '/'
-    local_filename = os.path.basename(file_path)
-    local_path = f"/tmp/{local_filename}"
-
-    print(f"📥 Downloading to: {local_path}")
+    # Download PDF
+    local_path = f"/tmp/{os.path.basename(file_path)}"
     blob.download_to_filename(local_path)
+    print(f"📥 Downloaded: {local_path}")
 
-    # Extract text → Gemini → BigQuery
+    # Extract text
     text = extract_text(local_path)
+
+    # Gemini
     parsed = call_gemini(text)
+
+    # Insert BigQuery
     insert_bigquery(client_id, file_path, parsed)
 
-    # Move to processed
+    # Move file
     move_to_processed(bucket, file_path)
 
-    print("🎉 COMPLETED SUCCESSFULLY")
+    print("🎉 DONE")
     return ("OK", 200)
-
-
-############################################################
-# Local dev support (Cloud Run needs this to start properly)
-############################################################
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
