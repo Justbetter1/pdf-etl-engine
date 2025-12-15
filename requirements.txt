@@ -1,8 +1,8 @@
 flask
 google-cloud-storage
 google-cloud-bigquery
-google-cloud-audit-log
-google-cloud-logging
+google-cloud-core
+google-auth
 vertexai
 pdfplumber
-functions-framework
+gunicorn
