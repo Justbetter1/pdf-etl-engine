@@ -50,7 +50,24 @@ PDF TEXT:
 {text}
 """
 
-    response = model.generate_content(prompt)
+try:
+        response = model.generate_content(
+            prompt,
+            generation_config={
+                "timeout": 120   # allow up to 2 minutes
+            }
+        )
+    except Exception as e:
+        print("❌ Gemini API error:", e)
+        return {
+            "summary": "",
+            "key_points": [],
+            "extracted_fields": {},
+            "tables": [],
+            "raw_text": text,
+            "error": str(e),
+        }
+
 
     try:
         return json.loads(response.text)
@@ -161,3 +178,4 @@ def event_handler():
 
     print("🎉 DONE")
     return ("ok", 200)
+
