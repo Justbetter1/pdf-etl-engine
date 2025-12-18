@@ -40,7 +40,7 @@ def extract_text(local_path):
 
 
 def call_gemini(text):
-    init(project=os.environ["GOOGLE_CLOUD_PROJECT"], location="us-central1")
+    init(project=os.environ.get("GOOGLE_CLOUD_PROJECT", "pdf-etl-479411"), location="us-central1")
     model = GenerativeModel("gemini-2.5-flash")
 
     prompt = f"""
@@ -50,11 +50,12 @@ PDF TEXT:
 {text}
 """
 
-try:
+    # --- Gemini call with timeout ---
+    try:
         response = model.generate_content(
             prompt,
             generation_config={
-                "timeout": 120   # allow up to 2 minutes
+                "timeout": 120  # allow up to 2 minutes
             }
         )
     except Exception as e:
@@ -68,7 +69,7 @@ try:
             "error": str(e),
         }
 
-
+    # --- Try to parse JSON ---
     try:
         return json.loads(response.text)
     except Exception:
@@ -178,4 +179,5 @@ def event_handler():
 
     print("🎉 DONE")
     return ("ok", 200)
+
 
