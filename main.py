@@ -8,7 +8,6 @@ from google.cloud import storage, bigquery
 from vertexai import init
 from vertexai.generative_models import GenerativeModel
 
-
 app = Flask(__name__)
 
 BUCKET_NAME = "pdf_platform_main"
@@ -16,9 +15,6 @@ DATASET = "etl_reports"
 TABLE = "documents"
 
 
-###########################################################
-# MOVE FILE TO /processed/
-###########################################################
 def move_to_processed(bucket, file_path):
     new_path = file_path.replace("incoming/", "processed/")
     src_blob = bucket.blob(file_path)
@@ -27,30 +23,22 @@ def move_to_processed(bucket, file_path):
         print("⛔ File missing — skipping move")
         return None
 
-    # Copy -> Delete
     bucket.copy_blob(src_blob, bucket, new_path)
     src_blob.delete()
-
-    print(f"📦 File moved to: {new_path}")
+    print(f"📦 File moved to {new_path}")
     return new_path
 
 
-###########################################################
-# EXTRACT TEXT USING PDFPLUMBER
-###########################################################
 def extract_text(local_path):
     try:
         with pdfplumber.open(local_path) as pdf:
             pages = [page.extract_text() or "" for page in pdf.pages]
         return "\n".join(pages)
     except Exception as e:
-        print("❌ PDF extract error:", e)
+        print("❌ PDF extraction error:", e)
         return ""
 
 
-###########################################################
-# CALL GEMINI MODEL
-###########################################################
 def call_gemini(text):
     init(project=os.environ["GOOGLE_CLOUD_PROJECT"], location="us-central1")
     model = GenerativeModel("gemini-2.5-flash")
@@ -78,9 +66,6 @@ PDF TEXT:
         }
 
 
-###########################################################
-# WRITE TO BIGQUERY
-###########################################################
 def insert_bigquery(client_id, filename, parsed):
     table = f"{os.environ['GOOGLE_CLOUD_PROJECT']}.{DATASET}.{TABLE}"
     client = bigquery.Client()
@@ -99,64 +84,53 @@ def insert_bigquery(client_id, filename, parsed):
 
     errors = client.insert_rows_json(table, [row])
     if errors:
-        print("❌ BigQuery insert error:", errors)
+        print("❌ BigQuery error:", errors)
     else:
         print("✅ Inserted into BigQuery")
 
 
-###########################################################
-# MAIN HANDLER — Eventarc → Cloud Run
-###########################################################
 @app.post("/")
-def event_handler():
+def handler():
     event = request.get_json(silent=True)
- print("🔍 FULL EVENT RECEIVED:", json.dumps(event, indent=2))
-    if not event:
-        print("⚠️ No JSON in request")
+
+    # Debug safely
+    print("🟦 RAW EVENT:", json.dumps(event, indent=2) if event else "NO EVENT")
+
+    if not event or "data" not in event:
+        print("⚠️ Not a valid GCS event")
         return ("ignored", 200)
 
-    # Eventarc always wraps GCS data in event["data"]
-    data = event.get("data")
-    if not data:
-        print("⚠️ No 'data' field → Not GCS event")
-        return ("ignored", 200)
-
+    data = event["data"]
     file_path = data.get("name")
     bucket_name = data.get("bucket")
 
     if not file_path or not bucket_name:
-        print("⚠️ Missing file name or bucket → Not valid GCS event")
+        print("⚠️ Missing fields → Not GCS event")
         return ("ignored", 200)
 
-    print("=======================")
     print(f"📄 Triggered: {file_path}")
-    print("=======================")
 
-    # Skip folders
     if file_path.endswith("/"):
         print("⛔ Folder event — ignored")
         return ("ok", 200)
 
-    # Skip already processed files
     if file_path.startswith("processed/"):
         print("⛔ Already processed — ignored")
         return ("ok", 200)
 
-    # Only process incoming/
     if not file_path.startswith("incoming/"):
         print("⛔ Not incoming — ignored")
         return ("ok", 200)
 
-    # Extract client_id (incoming/Client1/XYZ.pdf)
+    # incoming/Client1/file.pdf → client_id = "Client1"
     parts = file_path.split("/")
     if len(parts) < 3:
-        print("⚠️ Invalid path structure → skip")
+        print("⚠️ Invalid path structure")
         return ("ok", 200)
 
     _, client_id, _ = parts
     print(f"👤 Client ID: {client_id}")
 
-    # Prepare storage objects
     storage_client = storage.Client()
     bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(file_path)
@@ -165,19 +139,16 @@ def event_handler():
         print("⛔ File missing on GCS")
         return ("ok", 200)
 
-    # Download PDF locally
+    # Download
     local_path = f"/tmp/{os.path.basename(file_path)}"
     blob.download_to_filename(local_path)
-    print(f"📥 Downloaded to {local_path}")
+    print(f"📥 Downloaded: {local_path}")
 
-    # Extract text → Gemini → BigQuery
+    # Process
     text = extract_text(local_path)
     parsed = call_gemini(text)
     insert_bigquery(client_id, file_path, parsed)
-
-    # Move to processed
     move_to_processed(bucket, file_path)
 
-    print("🎉 Processing completed")
+    print("🎉 DONE")
     return ("ok", 200)
-
