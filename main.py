@@ -110,7 +110,7 @@ def insert_bigquery(client_id, filename, parsed):
 @app.post("/")
 def event_handler():
     event = request.get_json(silent=True)
-
+ print("🔍 FULL EVENT RECEIVED:", json.dumps(event, indent=2))
     if not event:
         print("⚠️ No JSON in request")
         return ("ignored", 200)
@@ -180,3 +180,4 @@ def event_handler():
 
     print("🎉 Processing completed")
     return ("ok", 200)
+
