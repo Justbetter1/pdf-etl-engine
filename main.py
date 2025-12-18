@@ -1,11 +1,13 @@
-import json
 import os
+import json
 import datetime
 import pdfplumber
+
 from flask import Flask, request
 from google.cloud import storage, bigquery
 from vertexai import init
 from vertexai.generative_models import GenerativeModel
+
 
 app = Flask(__name__)
 
@@ -19,21 +21,22 @@ TABLE = "documents"
 ###########################################################
 def move_to_processed(bucket, file_path):
     new_path = file_path.replace("incoming/", "processed/")
-    src = bucket.blob(file_path)
+    src_blob = bucket.blob(file_path)
 
-    if not src.exists():
+    if not src_blob.exists():
         print("⛔ File missing — skipping move")
         return None
 
-    bucket.copy_blob(src, bucket, new_path)
-    src.delete()
+    # Copy -> Delete
+    bucket.copy_blob(src_blob, bucket, new_path)
+    src_blob.delete()
 
-    print(f"📦 File moved to {new_path}")
+    print(f"📦 File moved to: {new_path}")
     return new_path
 
 
 ###########################################################
-# EXTRACT TEXT FROM PDF
+# EXTRACT TEXT USING PDFPLUMBER
 ###########################################################
 def extract_text(local_path):
     try:
@@ -41,19 +44,19 @@ def extract_text(local_path):
             pages = [page.extract_text() or "" for page in pdf.pages]
         return "\n".join(pages)
     except Exception as e:
-        print("❌ PDF extraction failed:", e)
+        print("❌ PDF extract error:", e)
         return ""
 
 
 ###########################################################
-# GEMINI CALL
+# CALL GEMINI MODEL
 ###########################################################
 def call_gemini(text):
     init(project=os.environ["GOOGLE_CLOUD_PROJECT"], location="us-central1")
     model = GenerativeModel("gemini-2.5-flash")
 
     prompt = f"""
-Extract structured information and return ONLY JSON:
+Extract structured information and return ONLY JSON.
 
 PDF TEXT:
 {text}
@@ -64,7 +67,7 @@ PDF TEXT:
     try:
         return json.loads(response.text)
     except Exception:
-        print("⚠️ Gemini returned non-JSON output")
+        print("⚠️ Gemini returned non-JSON")
         return {
             "summary": "",
             "key_points": [],
@@ -76,7 +79,7 @@ PDF TEXT:
 
 
 ###########################################################
-# INSERT INTO BIGQUERY
+# WRITE TO BIGQUERY
 ###########################################################
 def insert_bigquery(client_id, filename, parsed):
     table = f"{os.environ['GOOGLE_CLOUD_PROJECT']}.{DATASET}.{TABLE}"
@@ -102,71 +105,78 @@ def insert_bigquery(client_id, filename, parsed):
 
 
 ###########################################################
-# MAIN ENTRY — Eventarc → Cloud Run → POST /
+# MAIN HANDLER — Eventarc → Cloud Run
 ###########################################################
 @app.post("/")
-def handler():
-    envelope = request.get_json(silent=True)
+def event_handler():
+    event = request.get_json(silent=True)
 
-    if not envelope:
-        print("⚠️ No Eventarc envelope")
-        return ("Ignored", 200)
+    if not event:
+        print("⚠️ No JSON in request")
+        return ("ignored", 200)
 
-    # Eventarc Cloud Storage event format
-    event = envelope.get("data", {})
-    file_path = event.get("name")
+    # Eventarc always wraps GCS data in event["data"]
+    data = event.get("data")
+    if not data:
+        print("⚠️ No 'data' field → Not GCS event")
+        return ("ignored", 200)
 
-    if not file_path:
-        print("⚠️ Not a valid GCS event")
-        return ("Ignored", 200)
+    file_path = data.get("name")
+    bucket_name = data.get("bucket")
+
+    if not file_path or not bucket_name:
+        print("⚠️ Missing file name or bucket → Not valid GCS event")
+        return ("ignored", 200)
 
     print("=======================")
     print(f"📄 Triggered: {file_path}")
     print("=======================")
 
-    # Ignore folder events
+    # Skip folders
     if file_path.endswith("/"):
         print("⛔ Folder event — ignored")
-        return ("OK", 200)
+        return ("ok", 200)
 
-    # Ignore processed files
-    if "processed/" in file_path:
+    # Skip already processed files
+    if file_path.startswith("processed/"):
         print("⛔ Already processed — ignored")
-        return ("OK", 200)
+        return ("ok", 200)
 
-    # Must be incoming/
-    if "incoming/" not in file_path:
-        print("⛔ Not an incoming file — ignored")
-        return ("OK", 200)
+    # Only process incoming/
+    if not file_path.startswith("incoming/"):
+        print("⛔ Not incoming — ignored")
+        return ("ok", 200)
 
-    # First part → client ID
-    client_id = file_path.split("/")[0]
+    # Extract client_id (incoming/Client1/XYZ.pdf)
+    parts = file_path.split("/")
+    if len(parts) < 3:
+        print("⚠️ Invalid path structure → skip")
+        return ("ok", 200)
+
+    _, client_id, _ = parts
     print(f"👤 Client ID: {client_id}")
 
+    # Prepare storage objects
     storage_client = storage.Client()
-    bucket = storage_client.bucket(BUCKET_NAME)
+    bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(file_path)
 
     if not blob.exists():
-        print("⛔ File missing — skip")
-        return ("OK", 200)
+        print("⛔ File missing on GCS")
+        return ("ok", 200)
 
-    # Download PDF
+    # Download PDF locally
     local_path = f"/tmp/{os.path.basename(file_path)}"
     blob.download_to_filename(local_path)
-    print(f"📥 Downloaded: {local_path}")
+    print(f"📥 Downloaded to {local_path}")
 
-    # Extract text
+    # Extract text → Gemini → BigQuery
     text = extract_text(local_path)
-
-    # Gemini
     parsed = call_gemini(text)
-
-    # Insert BigQuery
     insert_bigquery(client_id, file_path, parsed)
 
-    # Move file
+    # Move to processed
     move_to_processed(bucket, file_path)
 
-    print("🎉 DONE")
-    return ("OK", 200)
+    print("🎉 Processing completed")
+    return ("ok", 200)
