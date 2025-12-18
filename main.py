@@ -90,47 +90,58 @@ def insert_bigquery(client_id, filename, parsed):
 
 
 @app.post("/")
-def handler():
+def event_handler():
     event = request.get_json(silent=True)
 
-    # Debug safely
-    print("🟦 RAW EVENT:", json.dumps(event, indent=2) if event else "NO EVENT")
-
-    if not event or "data" not in event:
-        print("⚠️ Not a valid GCS event")
+    if not event:
+        print("⚠️ No JSON in request")
         return ("ignored", 200)
 
-    data = event["data"]
-    file_path = data.get("name")
-    bucket_name = data.get("bucket")
+    # Detect if event is wrapped (Eventarc standard)
+    if "data" in event and isinstance(event["data"], dict):
+        payload = event["data"]
+    else:
+        # Your trigger sends RAW GCS OBJECT
+        payload = event  
+
+    print("🟦 RAW/PARSED EVENT:", json.dumps(payload, indent=2))
+
+    file_path = payload.get("name")
+    bucket_name = payload.get("bucket")
 
     if not file_path or not bucket_name:
-        print("⚠️ Missing fields → Not GCS event")
+        print("⚠️ Missing name/bucket → Not valid event")
         return ("ignored", 200)
 
+    print("=======================")
     print(f"📄 Triggered: {file_path}")
+    print("=======================")
 
+    # Skip folders
     if file_path.endswith("/"):
         print("⛔ Folder event — ignored")
         return ("ok", 200)
 
+    # Skip processed
     if file_path.startswith("processed/"):
         print("⛔ Already processed — ignored")
         return ("ok", 200)
 
+    # Only process incoming/
     if not file_path.startswith("incoming/"):
         print("⛔ Not incoming — ignored")
         return ("ok", 200)
 
-    # incoming/Client1/file.pdf → client_id = "Client1"
+    # incoming/Client1/filename.pdf
     parts = file_path.split("/")
     if len(parts) < 3:
-        print("⚠️ Invalid path structure")
+        print("⚠️ Invalid path")
         return ("ok", 200)
 
     _, client_id, _ = parts
     print(f"👤 Client ID: {client_id}")
 
+    # Download → Extract → Gemini → BigQuery → Move
     storage_client = storage.Client()
     bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(file_path)
@@ -139,12 +150,10 @@ def handler():
         print("⛔ File missing on GCS")
         return ("ok", 200)
 
-    # Download
     local_path = f"/tmp/{os.path.basename(file_path)}"
     blob.download_to_filename(local_path)
-    print(f"📥 Downloaded: {local_path}")
+    print(f"📥 Downloaded to {local_path}")
 
-    # Process
     text = extract_text(local_path)
     parsed = call_gemini(text)
     insert_bigquery(client_id, file_path, parsed)
