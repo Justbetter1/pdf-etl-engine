@@ -8,13 +8,29 @@ from google.cloud import storage, bigquery
 from vertexai import init
 from vertexai.generative_models import GenerativeModel
 
+
 app = Flask(__name__)
 
+# ==========================
+# CONFIG
+# ==========================
 BUCKET_NAME = "pdf_platform_main"
 DATASET = "etl_reports"
 TABLE = "documents"
 
+# Safe project ID detection for Cloud Run
+PROJECT_ID = (
+    os.environ.get("GOOGLE_CLOUD_PROJECT")
+    or os.environ.get("GOOGLE_CLOUD_PROJECT_NUMBER")
+    or "pdf-etl-479411"
+)
 
+print(f"🔧 Using PROJECT_ID = {PROJECT_ID}")
+
+
+# ==========================
+# MOVE FILE TO /processed/
+# ==========================
 def move_to_processed(bucket, file_path):
     new_path = file_path.replace("incoming/", "processed/")
     src_blob = bucket.blob(file_path)
@@ -25,39 +41,40 @@ def move_to_processed(bucket, file_path):
 
     bucket.copy_blob(src_blob, bucket, new_path)
     src_blob.delete()
-    print(f"📦 File moved to {new_path}")
+
+    print(f"📦 File moved → {new_path}")
     return new_path
 
 
+# ==========================
+# EXTRACT PDF TEXT
+# ==========================
 def extract_text(local_path):
     try:
         with pdfplumber.open(local_path) as pdf:
             pages = [page.extract_text() or "" for page in pdf.pages]
         return "\n".join(pages)
     except Exception as e:
-        print("❌ PDF extraction error:", e)
+        print("❌ PDF extract error:", e)
         return ""
 
 
+# ==========================
+# GEMINI CALL
+# ==========================
 def call_gemini(text):
-    init(project=os.environ.get("GOOGLE_CLOUD_PROJECT", "pdf-etl-479411"), location="us-central1")
-    model = GenerativeModel("gemini-2.5-flash")
+    try:
+        init(project=PROJECT_ID, location="us-central1")
+        model = GenerativeModel("gemini-2.5-flash")
 
-    prompt = f"""
+        prompt = f"""
 Extract structured information and return ONLY JSON.
 
 PDF TEXT:
 {text}
 """
+        response = model.generate_content(prompt)
 
-    # --- Gemini call with timeout ---
-    try:
-        response = model.generate_content(
-            prompt,
-            generation_config={
-                "timeout": 120  # allow up to 2 minutes
-            }
-        )
     except Exception as e:
         print("❌ Gemini API error:", e)
         return {
@@ -69,7 +86,7 @@ PDF TEXT:
             "error": str(e),
         }
 
-    # --- Try to parse JSON ---
+    # Try parsing JSON safely
     try:
         return json.loads(response.text)
     except Exception:
@@ -84,8 +101,11 @@ PDF TEXT:
         }
 
 
+# ==========================
+# WRITE TO BIGQUERY
+# ==========================
 def insert_bigquery(client_id, filename, parsed):
-    table = f"{os.environ['GOOGLE_CLOUD_PROJECT']}.{DATASET}.{TABLE}"
+    table = f"{PROJECT_ID}.{DATASET}.{TABLE}"
     client = bigquery.Client()
 
     row = {
@@ -100,84 +120,81 @@ def insert_bigquery(client_id, filename, parsed):
         "raw_error": parsed.get("error"),
     }
 
-    errors = client.insert_rows_json(table, [row])
-    if errors:
-        print("❌ BigQuery error:", errors)
-    else:
-        print("✅ Inserted into BigQuery")
+    try:
+        errors = client.insert_rows_json(table, [row])
+        if errors:
+            print("❌ BigQuery insert error:", errors)
+        else:
+            print("✅ Inserted into BigQuery")
+    except Exception as e:
+        print("❌ BigQuery FAILURE:", e)
 
 
+# ==========================
+# MAIN HANDLER
+# ==========================
 @app.post("/")
 def event_handler():
     event = request.get_json(silent=True)
 
+    # Always return 200 so Cloud Run does NOT retry forever
     if not event:
-        print("⚠️ No JSON in request")
-        return ("ignored", 200)
-
-    # Detect if event is wrapped (Eventarc standard)
-    if "data" in event and isinstance(event["data"], dict):
-        payload = event["data"]
-    else:
-        # Your trigger sends RAW GCS OBJECT
-        payload = event  
-
-    print("🟦 RAW/PARSED EVENT:", json.dumps(payload, indent=2))
-
-    file_path = payload.get("name")
-    bucket_name = payload.get("bucket")
-
-    if not file_path or not bucket_name:
-        print("⚠️ Missing name/bucket → Not valid event")
-        return ("ignored", 200)
-
-    print("=======================")
-    print(f"📄 Triggered: {file_path}")
-    print("=======================")
-
-    # Skip folders
-    if file_path.endswith("/"):
-        print("⛔ Folder event — ignored")
+        print("⚠️ Empty event payload")
         return ("ok", 200)
 
-    # Skip processed
-    if file_path.startswith("processed/"):
-        print("⛔ Already processed — ignored")
+    data = event.get("data")
+    if not data:
+        print("⚠️ Missing data in event")
+        return ("ok", 200)
+
+    file_path = data.get("name")
+    bucket_name = data.get("bucket")
+
+    if not file_path or not bucket_name:
+        print("⚠️ Invalid GCS payload")
+        return ("ok", 200)
+
+    print("🟦 EVENT:", json.dumps({"name": file_path, "bucket": bucket_name}, indent=2))
+
+    # Ignore folder events
+    if file_path.endswith("/"):
+        print("⛔ Folder — ignored")
         return ("ok", 200)
 
     # Only process incoming/
     if not file_path.startswith("incoming/"):
-        print("⛔ Not incoming — ignored")
+        print("⛔ Not inside incoming/ — ignored")
         return ("ok", 200)
 
-    # incoming/Client1/filename.pdf
+    # Extract client_id
     parts = file_path.split("/")
     if len(parts) < 3:
-        print("⚠️ Invalid path")
+        print("⚠️ Invalid file structure:", file_path)
         return ("ok", 200)
 
     _, client_id, _ = parts
-    print(f"👤 Client ID: {client_id}")
+    print(f"👤 Client ID = {client_id}")
 
-    # Download → Extract → Gemini → BigQuery → Move
+    # Download file
     storage_client = storage.Client()
     bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(file_path)
 
     if not blob.exists():
-        print("⛔ File missing on GCS")
+        print("⛔ File not found in bucket")
         return ("ok", 200)
 
     local_path = f"/tmp/{os.path.basename(file_path)}"
     blob.download_to_filename(local_path)
-    print(f"📥 Downloaded to {local_path}")
+    print(f"📥 Downloaded → {local_path}")
 
+    # Extract → Gemini → BigQuery
     text = extract_text(local_path)
     parsed = call_gemini(text)
     insert_bigquery(client_id, file_path, parsed)
+
+    # Move file
     move_to_processed(bucket, file_path)
 
-    print("🎉 DONE")
+    print("🎉 DONE — FULL SUCCESS")
     return ("ok", 200)
-
-
