@@ -1,200 +1,135 @@
 import os
 import json
 import datetime
-import pdfplumber
-
+import re
 from flask import Flask, request
-from google.cloud import storage, bigquery
-from vertexai import init
-from vertexai.generative_models import GenerativeModel
-
+from google.cloud import storage, bigquery, documentai_v1 as documentai
 
 app = Flask(__name__)
 
 # ==========================
 # CONFIG
 # ==========================
-BUCKET_NAME = "pdf_platform_main"
+PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT", "pdf-etl-479411")
 DATASET = "etl_reports"
-TABLE = "documents"
-
-# Safe project ID detection for Cloud Run
-PROJECT_ID = (
-    os.environ.get("GOOGLE_CLOUD_PROJECT")
-    or os.environ.get("GOOGLE_CLOUD_PROJECT_NUMBER")
-    or "pdf-etl-479411"
-)
-
-print(f"🔧 Using PROJECT_ID = {PROJECT_ID}")
-
+LOCATION = "us" # Ensure your DocAI processor is in this region
+PROCESSOR_ID = os.environ.get("DOC_AI_PROCESSOR_ID") # Set in Cloud Run Env Vars
 
 # ==========================
-# MOVE FILE TO /processed/
+# DYNAMIC TABLE LOGIC
 # ==========================
-def move_to_processed(bucket, file_path):
-    new_path = file_path.replace("incoming/", "processed/")
-    src_blob = bucket.blob(file_path)
+def get_or_create_client_table(client_id, extracted_fields):
+    bq_client = bigquery.Client()
+    table_id = f"{PROJECT_ID}.{DATASET}.{client_id.lower()}"
 
-    if not src_blob.exists():
-        print("⛔ File missing — skipping move")
-        return None
-
-    bucket.copy_blob(src_blob, bucket, new_path)
-    src_blob.delete()
-
-    print(f"📦 File moved → {new_path}")
-    return new_path
-
-
-# ==========================
-# EXTRACT PDF TEXT
-# ==========================
-def extract_text(local_path):
     try:
-        with pdfplumber.open(local_path) as pdf:
-            pages = [page.extract_text() or "" for page in pdf.pages]
-        return "\n".join(pages)
-    except Exception as e:
-        print("❌ PDF extract error:", e)
-        return ""
-
-
-# ==========================
-# GEMINI CALL
-# ==========================
-def call_gemini(text):
-    try:
-        init(project=PROJECT_ID, location="us-central1")
-        model = GenerativeModel("gemini-2.5-flash")
-
-        prompt = f"""
-Extract structured information and return ONLY JSON.
-
-PDF TEXT:
-{text}
-"""
-        response = model.generate_content(prompt)
-
-    except Exception as e:
-        print("❌ Gemini API error:", e)
-        return {
-            "summary": "",
-            "key_points": [],
-            "extracted_fields": {},
-            "tables": [],
-            "raw_text": text,
-            "error": str(e),
-        }
-
-    # Try parsing JSON safely
-    try:
-        return json.loads(response.text)
+        bq_client.get_table(table_id)
+        return table_id
     except Exception:
-        print("⚠️ Gemini returned non-JSON")
-        return {
-            "summary": "",
-            "key_points": [],
-            "extracted_fields": {},
-            "tables": [],
-            "raw_text": text,
-            "error": response.text,
-        }
+        print(f"✨ Creating new table for client: {client_id}")
+        schema = [
+            bigquery.SchemaField("row_id", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("file_name", "STRING"),
+            bigquery.SchemaField("client_id", "STRING"),
+            bigquery.SchemaField("uploaded_at", "TIMESTAMP"),
+            bigquery.SchemaField("raw_text", "STRING"),
+        ]
 
+        # Add dynamic KPI columns found by the AI
+        for key in extracted_fields.keys():
+            clean_col = re.sub(r'[^a-zA-Z0-9_]', '_', key).lower()
+            if not clean_col.startswith("kpi_"):
+                clean_col = f"kpi_{clean_col}"
+            schema.append(bigquery.SchemaField(clean_col, "STRING"))
+
+        table = bigquery.Table(table_id, schema=schema)
+        bq_client.create_table(table)
+        return table_id
 
 # ==========================
-# WRITE TO BIGQUERY
+# DOCUMENT AI ENGINE
 # ==========================
-def insert_bigquery(client_id, filename, parsed):
-    table = f"{PROJECT_ID}.{DATASET}.{TABLE}"
-    client = bigquery.Client()
+def run_doc_ai(content):
+    client = documentai.DocumentProcessorServiceClient(
+        client_options={"api_endpoint": f"{LOCATION}-documentai.googleapis.com"}
+    )
+    name = client.processor_path(PROJECT_ID, LOCATION, PROCESSOR_ID)
+    raw_doc = documentai.RawDocument(content=content, mime_type="application/pdf")
+    request = documentai.ProcessRequest(name=name, raw_document=raw_doc)
+    
+    result = client.process_document(request=request)
+    doc = result.document
 
-    row = {
-        "client_id": client_id,
-        "file_name": filename,
-        "uploaded_at": datetime.datetime.utcnow().isoformat(),
-        "summary": parsed.get("summary", ""),
-        "key_points": json.dumps(parsed.get("key_points", [])),
-        "extracted_fields": json.dumps(parsed.get("extracted_fields", {})),
-        "tables": json.dumps(parsed.get("tables", [])),
-        "raw_text": parsed.get("raw_text", ""),
-        "raw_error": parsed.get("error"),
-    }
-
-    try:
-        errors = client.insert_rows_json(table, [row])
-        if errors:
-            print("❌ BigQuery insert error:", errors)
-        else:
-            print("✅ Inserted into BigQuery")
-    except Exception as e:
-        print("❌ BigQuery FAILURE:", e)
-
+    fields = {}
+    for page in doc.pages:
+        for field in page.form_fields:
+            k = field.field_name.text_anchor.content.strip().replace("\n", " ")
+            v = field.field_value.text_anchor.content.strip().replace("\n", " ")
+            if k: fields[k] = v
+    
+    return fields, doc.text
 
 # ==========================
 # MAIN HANDLER
 # ==========================
 @app.post("/")
 def event_handler():
-    event = request.get_json(silent=True)
-
-    # Always return 200 so Cloud Run does NOT retry forever
-    if not event:
-        print("⚠️ Empty event payload")
-        return ("ok", 200)
-
-    data = event.get("data")
-    if not data:
-        print("⚠️ Missing data in event")
-        return ("ok", 200)
-
+    payload = request.get_json(silent=True) or {}
+    headers = request.headers
+    
+    # Unique ID to stop loops/duplicates
+    event_id = headers.get("ce-id") or headers.get("X-Goog-Message-Id") or str(datetime.datetime.now().timestamp())
+    
+    # Universal Parser for GitHub-based triggers
+    data = payload.get("data", payload)
     file_path = data.get("name")
     bucket_name = data.get("bucket")
 
-    if not file_path or not bucket_name:
-        print("⚠️ Invalid GCS payload")
-        return ("ok", 200)
+    if not file_path or not bucket_name or not file_path.startswith("incoming/"):
+        return ("Ignored", 200)
 
-    print("🟦 EVENT:", json.dumps({"name": file_path, "bucket": bucket_name}, indent=2))
+    try:
+        # 1. Identify Client (incoming/C1/file.pdf)
+        parts = file_path.split("/")
+        client_id = parts[1] if len(parts) > 1 else "unknown"
 
-    # Ignore folder events
-    if file_path.endswith("/"):
-        print("⛔ Folder — ignored")
-        return ("ok", 200)
+        # 2. Download and Process
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(file_path)
+        content = blob.download_as_bytes()
 
-    # Only process incoming/
-    if not file_path.startswith("incoming/"):
-        print("⛔ Not inside incoming/ — ignored")
-        return ("ok", 200)
+        fields, raw_text = run_doc_ai(content)
 
-    # Extract client_id
-    parts = file_path.split("/")
-    if len(parts) < 3:
-        print("⚠️ Invalid file structure:", file_path)
-        return ("ok", 200)
+        # 3. Dynamic BigQuery Insert
+        table_full_id = get_or_create_client_table(client_id, fields)
+        
+        row = {
+            "row_id": event_id,
+            "file_name": file_path,
+            "client_id": client_id,
+            "uploaded_at": datetime.datetime.utcnow().isoformat(),
+            "raw_text": raw_text
+        }
+        # Map fields to their kpi_ columns
+        for k, v in fields.items():
+            clean_col = re.sub(r'[^a-zA-Z0-9_]', '_', k).lower()
+            row[f"kpi_{clean_col}"] = v
 
-    _, client_id, _ = parts
-    print(f"👤 Client ID = {client_id}")
+        bq_client = bigquery.Client()
+        errors = bq_client.insert_rows_json(table_full_id, [row])
+        
+        if not errors:
+            # 4. Success -> Move file
+            new_path = file_path.replace("incoming/", "processed/")
+            bucket.copy_blob(blob, bucket, new_path)
+            blob.delete()
+            print(f"✅ Success: {client_id} -> {table_full_id}")
 
-    # Download file
-    storage_client = storage.Client()
-    bucket = storage_client.bucket(bucket_name)
-    blob = bucket.blob(file_path)
+    except Exception as e:
+        print(f"🔥 Error: {e}")
 
-    if not blob.exists():
-        print("⛔ File not found in bucket")
-        return ("ok", 200)
-
-    local_path = f"/tmp/{os.path.basename(file_path)}"
-    blob.download_to_filename(local_path)
-    print(f"📥 Downloaded → {local_path}")
-
-    # Extract → Gemini → BigQuery
-    text = extract_text(local_path)
-    parsed = call_gemini(text)
-    insert_bigquery(client_id, file_path, parsed)
-
-    # Move file
-    move_to_processed(bucket, file_path)
-
-    print("🎉 DONE — FULL SUCCESS")
     return ("ok", 200)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
