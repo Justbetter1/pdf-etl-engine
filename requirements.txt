@@ -1,8 +1,6 @@
-flask
-google-cloud-storage
-google-cloud-bigquery
-google-cloud-core
-google-auth
-vertexai
-pdfplumber
-gunicorn
+Flask==3.0.0
+gunicorn==21.2.0
+google-cloud-storage==2.14.0
+google-cloud-bigquery==3.15.0
+google-cloud-documentai==2.20.0
+cloudevents==1.10.1
