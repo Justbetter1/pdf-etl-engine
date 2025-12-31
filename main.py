@@ -16,7 +16,7 @@ PROJECT_ID = "pdf-etl-479411"
 DATASET = "etl_reports"
 LOCATION = "us-central1"
 
-# Initialize the NEW Gen AI Client
+# Initialize the Gen AI Client
 client = genai.Client(
     vertexai=True, 
     project=PROJECT_ID, 
@@ -24,7 +24,7 @@ client = genai.Client(
 )
 
 # ==========================
-# INTELLIGENT EXTRACTION (Gemini)
+# INTELLIGENT EXTRACTION
 # ==========================
 def extract_with_gemini(pdf_bytes):
     prompt = """
@@ -35,7 +35,6 @@ def extract_with_gemini(pdf_bytes):
     - Use lowercase keys with underscores (e.g., total_amount, invoice_date).
     """
     
-    # Send PDF directly to Gemini
     response = client.models.generate_content(
         model="gemini-2.0-flash-001",
         contents=[
@@ -47,21 +46,28 @@ def extract_with_gemini(pdf_bytes):
         ),
     )
     
-    # The new SDK returns a structured response; we just need the text (JSON)
-    return json.loads(response.text)
+    data = json.loads(response.text)
+
+    # FIX: Handle cases where Gemini returns a list instead of a dictionary
+    if isinstance(data, list) and len(data) > 0:
+        return data[0]
+    
+    return data
 
 # ==========================
 # DYNAMIC TABLE LOGIC
 # ==========================
 def get_or_create_table(client_id, data_sample):
     bq_client = bigquery.Client()
-    table_id = f"{PROJECT_ID}.{DATASET}.{client_id.lower()}"
+    # Clean client name for BigQuery (no spaces or dashes)
+    clean_client = re.sub(r'[^a-zA-Z0-9_]', '_', client_id).lower()
+    table_id = f"{PROJECT_ID}.{DATASET}.{clean_client}"
 
     try:
         bq_client.get_table(table_id)
         return table_id
     except:
-        print(f"✨ Creating smart table for: {client_id}")
+        print(f"✨ Creating smart table for: {clean_client}")
         schema = [
             bigquery.SchemaField("row_id", "STRING"),
             bigquery.SchemaField("file_name", "STRING"),
@@ -69,7 +75,9 @@ def get_or_create_table(client_id, data_sample):
         ]
         
         for key, value in data_sample.items():
-            # Auto-detect type from Gemini's JSON
+            # Clean column names
+            col_name = f"kpi_{re.sub(r'[^a-zA-Z0-9_]', '_', key).lower()}"
+            
             if isinstance(value, (int, float)):
                 field_type = "FLOAT"
             elif isinstance(value, str) and re.match(r'\d{4}-\d{2}-\d{2}', value):
@@ -77,7 +85,7 @@ def get_or_create_table(client_id, data_sample):
             else:
                 field_type = "STRING"
             
-            schema.append(bigquery.SchemaField(f"kpi_{key}", field_type))
+            schema.append(bigquery.SchemaField(col_name, field_type))
             
         table = bigquery.Table(table_id, schema=schema)
         bq_client.create_table(table)
@@ -97,7 +105,7 @@ def handle_event():
         return ("Ignored", 200)
 
     try:
-        # 1. Get Client Folder Name
+        # 1. Get Client Folder
         parts = file_path.split("/")
         client_id = parts[1] if len(parts) > 1 else "unknown"
 
@@ -119,8 +127,10 @@ def handle_event():
             "uploaded_at": datetime.datetime.utcnow().isoformat()
         }
         
+        # Add the extracted KPIs to the row
         for k, v in extracted_data.items():
-            row[f"kpi_{k}"] = v
+            col_name = f"kpi_{re.sub(r'[^a-zA-Z0-9_]', '_', k).lower()}"
+            row[col_name] = v
 
         bq_client = bigquery.Client()
         errors = bq_client.insert_rows_json(table_full_id, [row])
@@ -131,6 +141,8 @@ def handle_event():
             bucket.copy_blob(blob, bucket, new_path)
             blob.delete()
             print(f"✅ Success: {file_path}")
+        else:
+            print(f"❌ BigQuery Errors: {errors}")
 
     except Exception as e:
         print(f"🔥 Critical Error: {str(e)}")
