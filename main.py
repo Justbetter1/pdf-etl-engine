@@ -2,6 +2,7 @@ import os
 import json
 import datetime
 import re
+import time
 from flask import Flask, request
 from google.cloud import storage, bigquery
 from google import genai
@@ -9,143 +10,135 @@ from google.genai import types
 
 app = Flask(__name__)
 
-# ==========================
 # CONFIG
-# ==========================
 PROJECT_ID = "pdf-etl-479411"
 DATASET = "etl_reports"
 LOCATION = "us-central1"
 
-# Initialize the Gen AI Client
-client = genai.Client(
-    vertexai=True, 
-    project=PROJECT_ID, 
-    location=LOCATION
-)
+# Initialize Client
+client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
 
-# ==========================
-# INTELLIGENT EXTRACTION
-# ==========================
+# ==========================================
+# 1. THE BRAIN: Wait for Gemini to finish
+# ==========================================
 def extract_with_gemini(pdf_bytes):
+    print("🧠 Gemini is analyzing the PDF... waiting for full extraction.")
     prompt = """
-    Extract all key information (KPIs) from this document. 
-    Return the data in a clean JSON format.
-    - If a value is a price or number, return it as a float (e.g., 1500.50).
-    - If a value is a date, return it in YYYY-MM-DD format.
-    - Use lowercase keys with underscores (e.g., total_amount, invoice_date).
+    Analyze this PDF and extract EVERY single KPI or data point you see. 
+    Do not skip anything. Return a FLAT JSON object.
+    - Numbers: float (1500.0)
+    - Dates: YYYY-MM-DD
+    - Keys: lowercase_underscores
     """
     
+    # generate_content is a blocking call; it WAITS until Gemini is done.
     response = client.models.generate_content(
         model="gemini-2.0-flash-001",
-        contents=[
-            types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
-            prompt
-        ],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-        ),
+        contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
+        config=types.GenerateContentConfig(response_mime_type="application/json"),
     )
     
-    data = json.loads(response.text)
-
-    # FIX: Handle cases where Gemini returns a list instead of a dictionary
-    if isinstance(data, list) and len(data) > 0:
-        return data[0]
+    # Repair and Parse
+    clean_json = re.sub(r',\s*([\]}])', r'\1', response.text)
+    data = json.loads(clean_json)
     
-    return data
+    # Ensure we have a dictionary
+    extracted = data[0] if isinstance(data, list) else data
+    print(f"✅ Gemini finished! Found {len(extracted)} KPIs.")
+    return extracted
 
-# ==========================
-# DYNAMIC TABLE LOGIC
-# ==========================
-def get_or_create_table(client_id, data_sample):
+# ==========================================
+# 2. THE BUILDER: Sync Table with Gemini's Data
+# ==========================================
+def sync_bigquery_schema(client_id, extracted_data):
     bq_client = bigquery.Client()
-    # Clean client name for BigQuery (no spaces or dashes)
     clean_client = re.sub(r'[^a-zA-Z0-9_]', '_', client_id).lower()
     table_id = f"{PROJECT_ID}.{DATASET}.{clean_client}"
-
+    
     try:
-        bq_client.get_table(table_id)
-        return table_id
-    except:
-        print(f"✨ Creating smart table for: {clean_client}")
+        table = bq_client.get_table(table_id)
+        print(f"📊 Table '{clean_client}' found. Checking for new columns...")
+    except Exception:
+        print(f"✨ Table '{clean_client}' not found. Creating it now...")
+        # Start with standard system columns
         schema = [
             bigquery.SchemaField("row_id", "STRING"),
             bigquery.SchemaField("file_name", "STRING"),
             bigquery.SchemaField("uploaded_at", "TIMESTAMP"),
         ]
-        
-        for key, value in data_sample.items():
-            # Clean column names
-            col_name = f"kpi_{re.sub(r'[^a-zA-Z0-9_]', '_', key).lower()}"
-            
-            if isinstance(value, (int, float)):
-                field_type = "FLOAT"
-            elif isinstance(value, str) and re.match(r'\d{4}-\d{2}-\d{2}', value):
-                field_type = "DATE"
-            else:
-                field_type = "STRING"
-            
-            schema.append(bigquery.SchemaField(col_name, field_type))
-            
-        table = bigquery.Table(table_id, schema=schema)
-        bq_client.create_table(table)
-        return table_id
+        table = bq_client.create_table(bigquery.Table(table_id, schema=schema))
+        time.sleep(5) # CRITICAL: Wait for BQ to register the new table globally
+        table = bq_client.get_table(table_id)
 
-# ==========================
-# MAIN EVENT HANDLER
-# ==========================
+    # Now, compare Gemini's findings with BQ's current columns
+    existing_columns = {field.name for field in table.schema}
+    new_fields = []
+
+    for key, value in extracted_data.items():
+        col_name = f"kpi_{re.sub(r'[^a-zA-Z0-9_]', '_', key).lower()}"
+        if col_name not in existing_columns:
+            print(f"🆕 Gemini found a new KPI: '{col_name}'. Adding to BigQuery.")
+            dtype = "FLOAT" if isinstance(value, (int, float)) else "STRING"
+            new_fields.append(bigquery.SchemaField(col_name, dtype))
+
+    if new_fields:
+        table.schema += new_fields
+        bq_client.update_table(table, ["schema"])
+        print("🛠️ Schema updated successfully.")
+        time.sleep(2) # Wait for schema to propagate
+    
+    return table_id
+
+# ==========================================
+# 3. THE HANDLER
+# ==========================================
 @app.post("/")
 def handle_event():
     payload = request.get_json(silent=True) or {}
     data = payload.get("data", payload)
-    file_path = data.get("name")
-    bucket_name = data.get("bucket")
+    file_path = data.get("name", "")
 
-    if not file_path or "incoming/" not in file_path:
-        return ("Ignored", 200)
+    if "incoming/" not in file_path: return ("OK", 200)
 
     try:
-        # 1. Get Client Folder
-        parts = file_path.split("/")
-        client_id = parts[1] if len(parts) > 1 else "unknown"
-
-        # 2. Download PDF
+        client_id = file_path.split("/")[1]
+        
+        # Download
         storage_client = storage.Client()
-        bucket = storage_client.bucket(bucket_name)
+        bucket = storage_client.bucket(data.get("bucket"))
         blob = bucket.blob(file_path)
-        content = blob.download_as_bytes()
+        pdf_content = blob.download_as_bytes()
         
-        # 3. Extract with Gemini
-        extracted_data = extract_with_gemini(content)
+        # STEP 1: Gemini processes EVERYTHING first
+        kpis = extract_with_gemini(pdf_content)
 
-        # 4. Insert to BigQuery
-        table_full_id = get_or_create_table(client_id, extracted_data)
-        
+        # STEP 2: BigQuery prepares the "Box" based on EXACTLY what Gemini found
+        target_table = sync_bigquery_schema(client_id, kpis)
+
+        # STEP 3: Insert the data
         row = {
             "row_id": str(datetime.datetime.now().timestamp()),
             "file_name": file_path,
             "uploaded_at": datetime.datetime.utcnow().isoformat()
         }
-        
-        # Add the extracted KPIs to the row
-        for k, v in extracted_data.items():
-            col_name = f"kpi_{re.sub(r'[^a-zA-Z0-9_]', '_', k).lower()}"
-            row[col_name] = v
+        for k, v in kpis.items():
+            clean_key = f"kpi_{re.sub(r'[^a-zA-Z0-9_]', '_', k).lower()}"
+            row[clean_key] = v
 
         bq_client = bigquery.Client()
-        errors = bq_client.insert_rows_json(table_full_id, [row])
+        insert_errors = bq_client.insert_rows_json(target_table, [row])
         
-        if not errors:
-            # 5. Move to processed/
+        if not insert_errors:
+            # Move to processed/
             new_path = file_path.replace("incoming/", "processed/")
             bucket.copy_blob(blob, bucket, new_path)
             blob.delete()
-            print(f"✅ Success: {file_path}")
+            print(f"🚀 SUCCESS: {file_path} is now in BigQuery.")
         else:
-            print(f"❌ BigQuery Errors: {errors}")
+            print(f"❌ BigQuery Insert Errors: {insert_errors}")
 
     except Exception as e:
-        print(f"🔥 Critical Error: {str(e)}")
+        print(f"🔥 System Error: {str(e)}")
 
     return ("ok", 200)
 
