@@ -1,27 +1,32 @@
 import os
 import json
 import datetime
+import re
 from flask import Flask, request
 from google.cloud import storage, bigquery
-import vertexai
-from vertexai.generative_models import GenerativeModel, Part, GenerationConfig
+from google import genai
+from google.genai import types
 
 app = Flask(__name__)
 
+# ==========================
 # CONFIG
+# ==========================
 PROJECT_ID = "pdf-etl-479411"
 DATASET = "etl_reports"
-vertexai.init(project=PROJECT_ID, location="us-central1")
+LOCATION = "us-central1"
 
-# 1. Define the "Brain" and the expected types
-# You can expand this list as you grow!
-model = GenerativeModel("gemini-1.5-flash")
+# Initialize the NEW Gen AI Client
+client = genai.Client(
+    vertexai=True, 
+    project=PROJECT_ID, 
+    location=LOCATION
+)
 
 # ==========================
-# SMART EXTRACTION (Gemini)
+# INTELLIGENT EXTRACTION (Gemini)
 # ==========================
 def extract_with_gemini(pdf_bytes):
-    # This prompt tells Gemini exactly how to behave
     prompt = """
     Extract all key information (KPIs) from this document. 
     Return the data in a clean JSON format.
@@ -30,16 +35,19 @@ def extract_with_gemini(pdf_bytes):
     - Use lowercase keys with underscores (e.g., total_amount, invoice_date).
     """
     
-    pdf_part = Part.from_data(data=pdf_bytes, mime_type="application/pdf")
-    
-    # We force Gemini to give us JSON only
-    response = model.generate_content(
-        [prompt, pdf_part],
-        generation_config=GenerationConfig(
+    # Send PDF directly to Gemini
+    response = client.models.generate_content(
+        model="gemini-2.0-flash-001",
+        contents=[
+            types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
+            prompt
+        ],
+        config=types.GenerateContentConfig(
             response_mime_type="application/json",
         ),
     )
     
+    # The new SDK returns a structured response; we just need the text (JSON)
     return json.loads(response.text)
 
 # ==========================
@@ -53,17 +61,18 @@ def get_or_create_table(client_id, data_sample):
         bq_client.get_table(table_id)
         return table_id
     except:
+        print(f"✨ Creating smart table for: {client_id}")
         schema = [
             bigquery.SchemaField("row_id", "STRING"),
             bigquery.SchemaField("file_name", "STRING"),
             bigquery.SchemaField("uploaded_at", "TIMESTAMP"),
         ]
         
-        # Vertex AI already set the types for us!
         for key, value in data_sample.items():
+            # Auto-detect type from Gemini's JSON
             if isinstance(value, (int, float)):
                 field_type = "FLOAT"
-            elif isinstance(value, str) and len(value) == 10 and value.count("-") == 2:
+            elif isinstance(value, str) and re.match(r'\d{4}-\d{2}-\d{2}', value):
                 field_type = "DATE"
             else:
                 field_type = "STRING"
@@ -74,6 +83,9 @@ def get_or_create_table(client_id, data_sample):
         bq_client.create_table(table)
         return table_id
 
+# ==========================
+# MAIN EVENT HANDLER
+# ==========================
 @app.post("/")
 def handle_event():
     payload = request.get_json(silent=True) or {}
@@ -82,38 +94,48 @@ def handle_event():
     bucket_name = data.get("bucket")
 
     if not file_path or "incoming/" not in file_path:
-        return ("Skip", 200)
+        return ("Ignored", 200)
 
-    # 1. Get Client ID
-    client_id = file_path.split("/")[1]
+    try:
+        # 1. Get Client Folder Name
+        parts = file_path.split("/")
+        client_id = parts[1] if len(parts) > 1 else "unknown"
 
-    # 2. Extract with Vertex AI
-    storage_client = storage.Client()
-    bucket = storage_client.bucket(bucket_name)
-    blob = bucket.blob(file_path)
-    content = blob.download_as_bytes()
-    
-    # THE MAGIC HAPPENS HERE
-    extracted_data = extract_with_gemini(content)
+        # 2. Download PDF
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(file_path)
+        content = blob.download_as_bytes()
+        
+        # 3. Extract with Gemini
+        extracted_data = extract_with_gemini(content)
 
-    # 3. Insert to BigQuery
-    table_full_id = get_or_create_table(client_id, extracted_data)
-    
-    row = {
-        "row_id": str(datetime.datetime.now().timestamp()),
-        "file_name": file_path,
-        "uploaded_at": datetime.datetime.utcnow().isoformat()
-    }
-    
-    for k, v in extracted_data.items():
-        row[f"kpi_{k}"] = v
+        # 4. Insert to BigQuery
+        table_full_id = get_or_create_table(client_id, extracted_data)
+        
+        row = {
+            "row_id": str(datetime.datetime.now().timestamp()),
+            "file_name": file_path,
+            "uploaded_at": datetime.datetime.utcnow().isoformat()
+        }
+        
+        for k, v in extracted_data.items():
+            row[f"kpi_{k}"] = v
 
-    bq_client = bigquery.Client()
-    bq_client.insert_rows_json(table_full_id, [row])
-    
-    # 4. Cleanup
-    new_path = file_path.replace("incoming/", "processed/")
-    bucket.copy_blob(blob, bucket, new_path)
-    blob.delete()
-    
-    return ("Success", 200)
+        bq_client = bigquery.Client()
+        errors = bq_client.insert_rows_json(table_full_id, [row])
+        
+        if not errors:
+            # 5. Move to processed/
+            new_path = file_path.replace("incoming/", "processed/")
+            bucket.copy_blob(blob, bucket, new_path)
+            blob.delete()
+            print(f"✅ Success: {file_path}")
+
+    except Exception as e:
+        print(f"🔥 Critical Error: {str(e)}")
+
+    return ("ok", 200)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
