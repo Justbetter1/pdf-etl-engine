@@ -1,9 +1,8 @@
 Flask==3.0.0
+flask-cors==6.0.2
 gunicorn==21.2.0
 google-cloud-storage==2.14.0
 google-cloud-bigquery==3.15.0
 google-cloud-firestore==2.14.0
 google-genai==1.1.0
-firebase-admin
-flask-cors
-
+firebase-admin==7.1.0
