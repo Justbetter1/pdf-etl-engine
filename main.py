@@ -119,6 +119,11 @@ def handle_event():
     data = payload.get("data", payload)
     file_path = data.get("name", "")
 
+    # 🛑 NEW BLOCK: Ignore placeholders and non-PDFs
+    if ".placeholder" in file_path or not file_path.lower().endswith(".pdf"):
+        print(f"⏩ Skipping non-PDF or system file: {file_path}")
+        return jsonify({"status": "ignored", "reason": "non-pdf or placeholder"}), 200
+
     # Only process files in the incoming folder
     if "incoming/" not in file_path:
         return jsonify({"status": "skipped"}), 200
@@ -166,7 +171,7 @@ def handle_event():
         
         return jsonify({"status": "processed", "file": file_path}), 200
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"🔥 Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 def _build_cors_preflight_response():
