@@ -13,7 +13,7 @@ from google.genai import types
 
 app = Flask(__name__)
 
-# 🛡️ GLOBAL CORS - Allows Lovable to talk to Cloud Run
+# 🛡️ GLOBAL CORS
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
 # --- CONFIGURATION ---
@@ -22,7 +22,6 @@ DATASET = "etl_reports"
 LOCATION = "us-central1"
 BUCKET_NAME = "pdf_platform_main"
 
-# Initialize Firebase & GenAI once
 if not firebase_admin._apps:
     firebase_admin.initialize_app()
 db = firestore.client()
@@ -41,6 +40,45 @@ def get_user_id(req):
         return decoded_token["uid"]
     except Exception:
         return None
+
+# ==========================================
+# ✨ ROUTE: ACCOUNT SETUP (FIXED)
+# ==========================================
+@app.route("/setup-account", methods=["GET", "POST", "OPTIONS"])
+def setup_account():
+    if request.method == "OPTIONS": 
+        return _build_cors_preflight_response()
+    
+    # Allow GET just to verify the endpoint is alive in browser
+    if request.method == "GET":
+        return jsonify({"status": "online", "message": "Use POST with Auth to setup account"}), 200
+
+    uid = get_user_id(request)
+    if not uid: 
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    try:
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(BUCKET_NAME)
+        
+        # Create user folder structure in Storage
+        for folder in ["incoming", "processed"]:
+            blob = bucket.blob(f"{folder}/{uid}/.placeholder")
+            blob.upload_from_string("Init")
+
+        # Create basic folder docs in Firestore
+        for folder_type in ["invoices", "manifests"]:
+            db.collection("tenants").document(uid).collection("folders").document(folder_type).set({
+                "name": folder_type.capitalize(),
+                "status": "setup",
+                "is_trained": False,
+                "selected_kpis": [],
+                "created_at": datetime.datetime.utcnow()
+            }, merge=True)
+
+        return jsonify({"status": "success", "uid": uid}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ==========================================
 # 📊 BIGQUERY SCHEMA SYNC
@@ -76,18 +114,17 @@ def sync_bigquery_schema(uid, folder_id, kpi_list):
     return table_id
 
 # ==========================================
-# ✨ NEW: MASTER PDF ANALYSIS
+# ✨ ROUTE: MASTER PDF ANALYSIS
 # ==========================================
 @app.route("/analyze-master", methods=["POST", "OPTIONS"])
 def analyze_master():
     if request.method == "OPTIONS": return _build_cors_preflight_response()
-    
     uid = get_user_id(request)
     if not uid: return jsonify({"error": "Unauthorized"}), 401
     
     payload = request.get_json()
-    file_path = payload.get("file_path") # incoming/UID/master.pdf
-    folder_id = payload.get("folder_id") # e.g. "invoices"
+    file_path = payload.get("file_path")
+    folder_id = payload.get("folder_id")
 
     try:
         storage_client = storage.Client()
@@ -95,7 +132,6 @@ def analyze_master():
         pdf_bytes = blob.download_as_bytes()
 
         prompt = "Analyze this PDF. List every data field/KPI found. Return ONLY a JSON object with {field_name: example_value}."
-        
         resp = client.models.generate_content(
             model="gemini-2.0-flash-001",
             contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
@@ -105,50 +141,42 @@ def analyze_master():
         clean_text = re.sub(r'^```json\s*|```$', '', resp.text.strip(), flags=re.MULTILINE)
         detected_data = json.loads(clean_text)
 
-        # Update folder status
         db.collection("tenants").document(uid).collection("folders").document(folder_id).update({
             "master_file_url": f"gs://{BUCKET_NAME}/{file_path}",
             "status": "training"
         })
-
         return jsonify({"detected_kpis": detected_data}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# ✅ NEW: CONFIRM SELECTED KPIs
+# ✅ ROUTE: CONFIRM SELECTED KPIs
 # ==========================================
 @app.route("/confirm-kpis", methods=["POST", "OPTIONS"])
 def confirm_kpis():
     if request.method == "OPTIONS": return _build_cors_preflight_response()
-    
     uid = get_user_id(request)
     payload = request.get_json()
     folder_id = payload.get("folder_id")
-    selected_kpis = payload.get("selected_kpis") # List of strings
+    selected_kpis = payload.get("selected_kpis")
 
     try:
-        # 1. Lock in Firestore
         db.collection("tenants").document(uid).collection("folders").document(folder_id).update({
             "selected_kpis": selected_kpis,
             "status": "active",
             "is_trained": True
         })
-        
-        # 2. Prepare BigQuery Table
         sync_bigquery_schema(uid, folder_id, selected_kpis)
-        
-        return jsonify({"status": "success", "message": "Folder is now active"}), 200
+        return jsonify({"status": "success"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 🚀 BATCH ENGINE (PROCESS CHILD PDFs)
+# 🚀 ROUTE: BATCH ENGINE
 # ==========================================
 @app.route("/", methods=["POST", "OPTIONS"])
 def process_child_pdf():
     if request.method == "OPTIONS": return _build_cors_preflight_response()
-
     payload = request.get_json(silent=True) or {}
     data = payload.get("data", payload)
     file_path = data.get("name", "")
@@ -156,19 +184,15 @@ def process_child_pdf():
     if ".placeholder" in file_path or not file_path.lower().endswith(".pdf"):
         return jsonify({"status": "ignored"}), 200
 
-    # Logic: incoming/[UID]/[FOLDER_ID]/file.pdf
     parts = file_path.split("/")
     if len(parts) < 3: return jsonify({"error": "Invalid path"}), 400
     uid, folder_id = parts[1], parts[2]
 
     try:
-        # 1. Get Folder Config
         folder_ref = db.collection("tenants").document(uid).collection("folders").document(folder_id).get()
         if not folder_ref.exists: raise Exception("Folder not trained")
-        config = folder_ref.to_dict()
-        kpi_list = config.get("selected_kpis", [])
+        kpi_list = folder_ref.to_dict().get("selected_kpis", [])
 
-        # 2. Gemini Targeted Extraction
         storage_client = storage.Client()
         blob = storage_client.bucket(BUCKET_NAME).blob(file_path)
         pdf_bytes = blob.download_as_bytes()
@@ -183,7 +207,6 @@ def process_child_pdf():
         clean_text = re.sub(r'^```json\s*|```$', '', resp.text.strip(), flags=re.MULTILINE)
         extracted = json.loads(clean_text)
 
-        # 3. Save to BigQuery
         table_id = sync_bigquery_schema(uid, folder_id, kpi_list)
         row = {
             "row_id": f"row_{int(time.time())}",
@@ -195,22 +218,18 @@ def process_child_pdf():
             row[safe_key] = str(extracted.get(k, ""))
 
         bigquery.Client().insert_rows_json(table_id, [row])
-
-        # 4. Move to processed
         new_path = file_path.replace("incoming/", "processed/")
         storage_client.bucket(BUCKET_NAME).copy_blob(blob, storage_client.bucket(BUCKET_NAME), new_path)
         blob.delete()
-
         return jsonify({"status": "success"}), 200
     except Exception as e:
-        print(f"Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 def _build_cors_preflight_response():
     response = make_response()
     response.headers.add("Access-Control-Allow-Origin", "*")
     response.headers.add("Access-Control-Allow-Headers", "Content-Type,Authorization")
-    response.headers.add("Access-Control-Allow-Methods", "POST")
+    response.headers.add("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
     return response, 204
 
 if __name__ == "__main__":
