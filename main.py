@@ -13,9 +13,10 @@ from google.genai import types
 
 # 1. Initialize Flask & CORS
 app = Flask(__name__)
+# Global CORS to allow Lovable to communicate
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
-# 2. Configuration
+# 2. Configuration - Ensure these match your GCP Console
 PROJECT_ID = "pdf-etl-479411"
 DATASET = "etl_reports"
 LOCATION = "us-central1"
@@ -42,7 +43,7 @@ def get_user_id(req):
         return None
 
 # ==========================================
-# 📊 BIGQUERY SCHEMA SYNC (CRITICAL FOR SAVING)
+# 📊 BIGQUERY SCHEMA SYNC
 # ==========================================
 def sync_bigquery_schema(uid, folder_id, kpi_list):
     bq_client = bigquery.Client()
@@ -79,7 +80,7 @@ def sync_bigquery_schema(uid, folder_id, kpi_list):
     return table_id
 
 # ==========================================
-# ✨ 1. ACCOUNT SETUP
+# ✨ 1. ACCOUNT SETUP (CLEAN INITIALIZATION)
 # ==========================================
 @app.route("/setup-account", methods=["POST", "OPTIONS"])
 def setup_account():
@@ -88,16 +89,17 @@ def setup_account():
     if not uid: return jsonify({"error": "Unauthorized"}), 401
     
     try:
+        # Just create the user profile record. No folders created yet.
         db.collection("tenants").document(uid).set({
             "account_status": "active",
             "setup_date": datetime.datetime.utcnow()
         }, merge=True)
-        return jsonify({"status": "success", "message": "Ready to create folders"}), 200
+        return jsonify({"status": "success", "message": "Account initialized. Create your first folder."}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 📂 2. DYNAMIC FOLDER CREATION
+# 📂 2. DYNAMIC FOLDER CREATION (USER-DRIVEN)
 # ==========================================
 @app.route("/create-folder", methods=["POST", "OPTIONS"])
 def create_folder():
@@ -107,25 +109,33 @@ def create_folder():
     
     try:
         payload = request.get_json()
-        user_input_name = payload.get("name")
+        user_input_name = payload.get("name") # e.g., "Medical Records"
+        
+        if not user_input_name:
+            return jsonify({"error": "Folder name is required"}), 400
+
+        # Clean the name for GCS paths (lowercase, underscores)
         folder_id = re.sub(r'[^a-zA-Z0-9_]', '_', user_input_name).lower()
 
         storage_client = storage.Client()
         bucket = storage_client.bucket(BUCKET_NAME)
         
-        # Initialize GCS subfolders
+        # Create user-named structure: incoming/UID/FOLDER_ID/master/ & batch/
         bucket.blob(f"incoming/{uid}/{folder_id}/master/.placeholder").upload_from_string("init")
         bucket.blob(f"incoming/{uid}/{folder_id}/batch/.placeholder").upload_from_string("init")
 
+        # Save record to Firestore
         db.collection("tenants").document(uid).collection("folders").document(folder_id).set({
             "display_name": user_input_name,
             "folder_id": folder_id,
             "is_trained": False,
-            "status": "waiting_for_master",
+            "status": "waiting_for_training",
             "created_at": datetime.datetime.utcnow()
         })
+
         return jsonify({"status": "success", "folder_id": folder_id}), 200
     except Exception as e:
+        print(f"❌ CREATE FOLDER ERROR: {e}")
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
@@ -146,7 +156,7 @@ def analyze_master():
         blob = storage_client.bucket(BUCKET_NAME).blob(file_path)
         pdf_bytes = blob.download_as_bytes()
 
-        prompt = "Analyze this PDF. List every field/KPI. Return ONLY JSON {field: example_value}."
+        prompt = "Analyze this document. List every data field/KPI found. Return ONLY a JSON object with {field_name: example_value}."
         resp = client.models.generate_content(
             model="gemini-2.0-flash-001",
             contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
@@ -174,16 +184,17 @@ def confirm_kpis():
     try:
         db.collection("tenants").document(uid).collection("folders").document(folder_id).update({
             "selected_kpis": selected_kpis,
-            "is_trained": True,
-            "status": "active"
+            "status": "active",
+            "is_trained": True
         })
+        # Build the BigQuery table based on these KPIs
         sync_bigquery_schema(uid, folder_id, selected_kpis)
         return jsonify({"status": "success"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 🚜 5. FULL BATCH ENGINE (GCS TRIGGER)
+# 🚜 5. BATCH PROCESSING ENGINE (GCS TRIGGER)
 # ==========================================
 @app.route("/", methods=["POST"])
 def gcs_trigger_handler():
@@ -191,11 +202,11 @@ def gcs_trigger_handler():
     data = payload.get("data", payload)
     file_path = data.get("name", "")
 
-    # 🛡️ ENHANCEMENTS: Skip non-PDFs and Placeholders
-    if not file_path.lower().endswith(".pdf") or ".placeholder" in file_path:
+    # 🛡️ SAFETY 1: Skip placeholders and non-PDFs
+    if ".placeholder" in file_path or not file_path.lower().endswith(".pdf"):
         return jsonify({"status": "ignored"}), 200
 
-    # Extract: incoming/[UID]/[FOLDER]/batch/[FILE]
+    # 🛡️ SAFETY 2: Ensure correct path: incoming/[UID]/[FOLDER]/batch/[FILE]
     parts = file_path.split("/")
     if len(parts) < 5 or parts[3] != "batch":
         return jsonify({"status": "ignored_non_batch"}), 200
@@ -203,7 +214,7 @@ def gcs_trigger_handler():
     uid, folder_id = parts[1], parts[2]
 
     try:
-        # 🛡️ TRAINING SHIELD: Check if folder is ready
+        # 🛡️ SAFETY 3: Only process if folder is trained
         folder_ref = db.collection("tenants").document(uid).collection("folders").document(folder_id).get()
         folder_data = folder_ref.to_dict()
 
@@ -234,24 +245,26 @@ def gcs_trigger_handler():
             "file_name": file_path.split("/")[-1],
             "uploaded_at": datetime.datetime.utcnow().isoformat()
         }
-        # Map extracted data to BigQuery kpi_ columns
+        # Map extracted data to BigQuery columns prefixed with kpi_
         for k in kpis:
             safe_k = f"kpi_{re.sub(r'[^a-zA-Z0-9_]', '_', k).lower()}"
             row[safe_k] = str(extracted.get(k, "N/A"))
 
         bigquery.Client().insert_rows_json(table_id, [row])
 
-        # --- ARCHIVE ---
+        # --- ARCHIVE PROCESSED FILE ---
         new_path = file_path.replace("incoming/", "processed/")
         storage_client.bucket(BUCKET_NAME).copy_blob(blob, storage_client.bucket(BUCKET_NAME), new_path)
         blob.delete()
 
         return jsonify({"status": "success"}), 200
     except Exception as e:
-        print(f"❌ ERROR: {e}")
+        print(f"❌ PROCESSING ERROR: {e}")
         return jsonify({"status": "error", "message": str(e)}), 200
 
-# --- CORS PREFLIGHT ---
+# ==========================================
+# 🛠️ CORS PREFLIGHT HELPERS
+# ==========================================
 def _build_cors_preflight_response():
     response = make_response()
     response.headers.add("Access-Control-Allow-Origin", "*")
