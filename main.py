@@ -13,7 +13,7 @@ from google.genai import types
 
 app = Flask(__name__)
 
-# 🛡️ GLOBAL CORS
+# 🛡️ GLOBAL CORS - Allows Lovable to communicate
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
 # --- CONFIGURATION ---
@@ -42,76 +42,62 @@ def get_user_id(req):
         return None
 
 # ==========================================
-# ✨ ROUTE: ACCOUNT SETUP (FIXED)
+# ✨ NEW: DYNAMIC FOLDER CREATION
 # ==========================================
-@app.route("/setup-account", methods=["GET", "POST", "OPTIONS"])
-def setup_account():
-    if request.method == "OPTIONS": 
-        return _build_cors_preflight_response()
-    
-    # Allow GET just to verify the endpoint is alive in browser
-    if request.method == "GET":
-        return jsonify({"status": "online", "message": "Use POST with Auth to setup account"}), 200
-
+@app.route("/create-folder", methods=["POST", "OPTIONS"])
+def create_folder():
+    if request.method == "OPTIONS": return _build_cors_preflight_response()
     uid = get_user_id(request)
-    if not uid: 
-        return jsonify({"error": "Unauthorized"}), 401
+    if not uid: return jsonify({"error": "Unauthorized"}), 401
     
+    payload = request.get_json()
+    folder_display_name = payload.get("name") # e.g. "Annual Revenue"
+    folder_id = re.sub(r'[^a-zA-Z0-9_]', '_', folder_display_name).lower()
+
     try:
         storage_client = storage.Client()
         bucket = storage_client.bucket(BUCKET_NAME)
         
-        # Create user folder structure in Storage
-        for folder in ["incoming", "processed"]:
-            blob = bucket.blob(f"{folder}/{uid}/.placeholder")
-            blob.upload_from_string("Init")
+        # Create structure: incoming/UID/FOLDER_ID/master/ & batch/
+        bucket.blob(f"incoming/{uid}/{folder_id}/master/.placeholder").upload_from_string("init")
+        bucket.blob(f"incoming/{uid}/{folder_id}/batch/.placeholder").upload_from_string("init")
 
-        # Create basic folder docs in Firestore
-        for folder_type in ["invoices", "manifests"]:
-            db.collection("tenants").document(uid).collection("folders").document(folder_type).set({
-                "name": folder_type.capitalize(),
-                "status": "setup",
-                "is_trained": False,
-                "selected_kpis": [],
-                "created_at": datetime.datetime.utcnow()
-            }, merge=True)
-
-        return jsonify({"status": "success", "uid": uid}), 200
+        db.collection("tenants").document(uid).collection("folders").document(folder_id).set({
+            "name": folder_display_name,
+            "status": "setup",
+            "is_trained": False,
+            "selected_kpis": [],
+            "created_at": datetime.datetime.utcnow()
+        })
+        return jsonify({"status": "success", "folder_id": folder_id}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 📊 BIGQUERY SCHEMA SYNC
+# ✨ ROUTE: ACCOUNT SETUP (INITIALIZER)
 # ==========================================
-def sync_bigquery_schema(uid, folder_id, kpi_list):
-    bq_client = bigquery.Client()
-    clean_uid = re.sub(r'[^a-zA-Z0-9_]', '_', uid).lower()
-    clean_folder = re.sub(r'[^a-zA-Z0-9_]', '_', folder_id).lower()
-    table_id = f"{PROJECT_ID}.{DATASET}.{clean_uid}_{clean_folder}"
+@app.route("/setup-account", methods=["GET", "POST", "OPTIONS"])
+def setup_account():
+    if request.method == "OPTIONS": return _build_cors_preflight_response()
+    uid = get_user_id(request)
+    if not uid: return jsonify({"error": "Unauthorized"}), 401
     
     try:
-        table = bq_client.get_table(table_id)
-    except Exception:
-        schema = [
-            bigquery.SchemaField("row_id", "STRING"),
-            bigquery.SchemaField("file_name", "STRING"),
-            bigquery.SchemaField("uploaded_at", "TIMESTAMP"),
-        ]
-        table = bq_client.create_table(bigquery.Table(table_id, schema=schema))
-        time.sleep(2)
-        table = bq_client.get_table(table_id)
-
-    existing_cols = {field.name for field in table.schema}
-    new_fields = []
-    for kpi in kpi_list:
-        col_name = f"kpi_{re.sub(r'[^a-zA-Z0-9_]', '_', kpi).lower()}"
-        if col_name not in existing_cols:
-            new_fields.append(bigquery.SchemaField(col_name, "STRING"))
-
-    if new_fields:
-        table.schema += new_fields
-        bq_client.update_table(table, ["schema"])
-    return table_id
+        # Create a default "Invoices" folder so the user isn't empty on start
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(BUCKET_NAME)
+        bucket.blob(f"incoming/{uid}/invoices/master/.placeholder").upload_from_string("init")
+        
+        db.collection("tenants").document(uid).set({"created_at": datetime.datetime.utcnow()}, merge=True)
+        db.collection("tenants").document(uid).collection("folders").document("invoices").set({
+            "name": "Invoices",
+            "status": "setup",
+            "is_trained": False,
+            "selected_kpis": []
+        }, merge=True)
+        return jsonify({"status": "success"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ==========================================
 # ✨ ROUTE: MASTER PDF ANALYSIS
@@ -123,7 +109,7 @@ def analyze_master():
     if not uid: return jsonify({"error": "Unauthorized"}), 401
     
     payload = request.get_json()
-    file_path = payload.get("file_path")
+    file_path = payload.get("file_path") # incoming/UID/FOLDER/master/file.pdf
     folder_id = payload.get("folder_id")
 
     try:
@@ -172,7 +158,7 @@ def confirm_kpis():
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 🚀 ROUTE: BATCH ENGINE
+# 🚜 BATCH ENGINE (GCS TRIGGER)
 # ==========================================
 @app.route("/", methods=["POST", "OPTIONS"])
 def process_child_pdf():
@@ -181,32 +167,42 @@ def process_child_pdf():
     data = payload.get("data", payload)
     file_path = data.get("name", "")
 
+    # 1. Skip non-targets
     if ".placeholder" in file_path or not file_path.lower().endswith(".pdf"):
         return jsonify({"status": "ignored"}), 200
 
+    # 2. Extract Structure: incoming/UID/FOLDER/TYPE/file.pdf
     parts = file_path.split("/")
-    if len(parts) < 3: return jsonify({"error": "Invalid path"}), 400
-    uid, folder_id = parts[1], parts[2]
+    if len(parts) < 5: return jsonify({"status": "ignored"}), 200
+    
+    uid, folder_id, upload_type = parts[1], parts[2], parts[3]
+
+    # 3. Ignore master files in the automated extraction route
+    if upload_type == "master":
+        return jsonify({"status": "training_file_ignored"}), 200
 
     try:
         folder_ref = db.collection("tenants").document(uid).collection("folders").document(folder_id).get()
-        if not folder_ref.exists: raise Exception("Folder not trained")
-        kpi_list = folder_ref.to_dict().get("selected_kpis", [])
+        if not folder_ref.exists or not folder_ref.to_dict().get("is_trained"):
+            return jsonify({"status": "waiting_for_training"}), 200
 
+        kpi_list = folder_ref.to_dict().get("selected_kpis", [])
+        
+        # --- Gemini Process ---
         storage_client = storage.Client()
         blob = storage_client.bucket(BUCKET_NAME).blob(file_path)
         pdf_bytes = blob.download_as_bytes()
 
-        prompt = f"Extract only these fields from this PDF: {kpi_list}. Return JSON."
+        prompt = f"Extract only these fields: {kpi_list}. Return JSON."
         resp = client.models.generate_content(
             model="gemini-2.0-flash-001",
             contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
             config=types.GenerateContentConfig(response_mime_type="application/json"),
         )
-        
         clean_text = re.sub(r'^```json\s*|```$', '', resp.text.strip(), flags=re.MULTILINE)
         extracted = json.loads(clean_text)
 
+        # --- BigQuery Sync & Save ---
         table_id = sync_bigquery_schema(uid, folder_id, kpi_list)
         row = {
             "row_id": f"row_{int(time.time())}",
@@ -218,12 +214,40 @@ def process_child_pdf():
             row[safe_key] = str(extracted.get(k, ""))
 
         bigquery.Client().insert_rows_json(table_id, [row])
+
+        # --- Move to processed ---
         new_path = file_path.replace("incoming/", "processed/")
         storage_client.bucket(BUCKET_NAME).copy_blob(blob, storage_client.bucket(BUCKET_NAME), new_path)
         blob.delete()
+
         return jsonify({"status": "success"}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 200
+
+# --- Helper Functions ---
+def sync_bigquery_schema(uid, folder_id, kpi_list):
+    bq_client = bigquery.Client()
+    clean_uid = re.sub(r'[^a-zA-Z0-9_]', '_', uid).lower()
+    clean_folder = re.sub(r'[^a-zA-Z0-9_]', '_', folder_id).lower()
+    table_id = f"{PROJECT_ID}.{DATASET}.{clean_uid}_{clean_folder}"
+    try:
+        table = bq_client.get_table(table_id)
+    except Exception:
+        schema = [bigquery.SchemaField("row_id", "STRING"), bigquery.SchemaField("file_name", "STRING"), bigquery.SchemaField("uploaded_at", "TIMESTAMP")]
+        table = bq_client.create_table(bigquery.Table(table_id, schema=schema))
+        time.sleep(1)
+        table = bq_client.get_table(table_id)
+    existing_cols = {field.name for field in table.schema}
+    new_fields = []
+    for kpi in kpi_list:
+        col_name = f"kpi_{re.sub(r'[^a-zA-Z0-9_]', '_', kpi).lower()}"
+        if col_name not in existing_cols:
+            new_fields.append(bigquery.SchemaField(col_name, "STRING"))
+    if new_fields:
+        table.schema += new_fields
+        bq_client.update_table(table, ["schema"])
+    return table_id
 
 def _build_cors_preflight_response():
     response = make_response()
