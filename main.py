@@ -13,13 +13,17 @@ from google.genai import types
 
 # 1. Initialize Flask & CORS
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+# Enhanced CORS to match the Cloud Shell settings we applied
+CORS(app, resources={r"/*": {
+    "origins": "*",
+    "allow_headers": ["Authorization", "Content-Type"],
+    "methods": ["GET", "POST", "OPTIONS"]
+}}, supports_credentials=True)
 
-# 2. Configuration - DOUBLE CHECK THESE IN GCP CONSOLE
+# 2. Configuration
 PROJECT_ID = "pdf-etl-479411"
 DATASET = "etl_reports"
 LOCATION = "us-central1"
-# Make sure this matches your bucket name exactly
 BUCKET_NAME = "pdf_platform_main" 
 
 # 3. Initialize Google Services
@@ -28,23 +32,27 @@ try:
         firebase_admin.initialize_app()
     db = firestore.client()
     client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
-    print(f"✅ Service initialized. Target Bucket: {BUCKET_NAME}")
+    print(f"🚀 Backend active. Project: {PROJECT_ID} | Bucket: {BUCKET_NAME}")
 except Exception as e:
-    print(f"❌ Initialization Error: {e}")
+    print(f"❌ Startup Error: {e}")
 
 # ==========================================
 # 🛡️ AUTHENTICATION HELPER
 # ==========================================
 def get_user_id(req):
     auth_header = req.headers.get("Authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
+    if not auth_header:
+        print("❌ AUTH ERROR: Missing Authorization header")
+        return None
+    if not auth_header.startswith("Bearer "):
+        print("❌ AUTH ERROR: Invalid header format")
         return None
     try:
         token = auth_header.split("Bearer ")[1]
         decoded_token = auth.verify_id_token(token)
         return decoded_token["uid"]
     except Exception as e:
-        print(f"⚠️ Auth Error: {e}")
+        print(f"❌ AUTH ERROR: Token invalid: {e}")
         return None
 
 # ==========================================
@@ -78,7 +86,6 @@ def sync_bigquery_schema(uid, folder_id, kpi_list):
     if new_fields:
         table.schema += new_fields
         bq_client.update_table(table, ["schema"])
-    
     return table_id
 
 # ==========================================
@@ -93,15 +100,15 @@ def setup_account():
     try:
         db.collection("tenants").document(uid).set({
             "account_status": "active",
-            "setup_date": datetime.datetime.utcnow()
+            "setup_date": datetime.datetime.utcnow(),
+            "uid": uid
         }, merge=True)
         return jsonify({"status": "success", "uid": uid}), 200
     except Exception as e:
-        print(f"❌ Account Setup Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 📂 2. DYNAMIC FOLDER CREATION (FIXED)
+# 📂 2. DYNAMIC FOLDER CREATION
 # ==========================================
 @app.route("/create-folder", methods=["POST", "OPTIONS"])
 def create_folder():
@@ -114,36 +121,32 @@ def create_folder():
         name = payload.get("name")
         folder_id = re.sub(r'[^a-zA-Z0-9_]', '_', name).lower()
 
-        # 1. Create Folders in Storage
         storage_client = storage.Client()
         bucket = storage_client.bucket(BUCKET_NAME)
         
-        # Check if bucket exists first
-        if not bucket.exists():
-            print(f"❌ Error: Bucket {BUCKET_NAME} does not exist!")
-            return jsonify({"error": f"Bucket {BUCKET_NAME} not found"}), 500
+        # Placeholders
+        bucket.blob(f"incoming/{uid}/{folder_id}/master/.placeholder").upload_from_string("init")
+        bucket.blob(f"incoming/{uid}/{folder_id}/batch/.placeholder").upload_from_string("init")
 
-        # Upload placeholders
-        m_path = f"incoming/{uid}/{folder_id}/master/.placeholder"
-        b_path = f"incoming/{uid}/{folder_id}/batch/.placeholder"
-        
-        bucket.blob(m_path).upload_from_string("init")
-        bucket.blob(b_path).upload_from_string("init")
-        print(f"✅ Created Storage paths for {folder_id}")
-
-        # 2. Update Firestore
-        db.collection("tenants").document(uid).collection("folders").document(folder_id).set({
+        # Firestore Data Object
+        folder_data = {
             "display_name": name,
             "folder_id": folder_id,
             "is_trained": False,
             "status": "waiting_for_training",
-            "created_at": datetime.datetime.utcnow()
-        })
-        print(f"✅ Updated Firestore for {folder_id}")
+            "created_at": datetime.datetime.utcnow().isoformat(),
+            "owner": uid
+        }
+        db.collection("tenants").document(uid).collection("folders").document(folder_id).set(folder_data)
 
-        return jsonify({"status": "success", "folder_id": folder_id}), 200
+        # We return the full data so the frontend can update its list immediately
+        return jsonify({
+            "status": "success", 
+            "folder_id": folder_id,
+            "folder": folder_data
+        }), 200
     except Exception as e:
-        print(f"❌ Create Folder Failed: {e}")
+        print(f"❌ Folder Creation Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
@@ -163,7 +166,7 @@ def analyze_master():
         blob = storage_client.bucket(BUCKET_NAME).blob(file_path)
         pdf_bytes = blob.download_as_bytes()
 
-        prompt = "List data labels in this PDF. Return ONLY JSON {field: example}."
+        prompt = "Identify data labels in this PDF. Return ONLY JSON {field: example}."
         resp = client.models.generate_content(
             model="gemini-2.0-flash-001",
             contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
@@ -225,7 +228,7 @@ def gcs_trigger_handler():
         blob = storage_client.bucket(BUCKET_NAME).blob(file_path)
         pdf_bytes = blob.download_as_bytes()
 
-        prompt = f"Extract fields: {kpis}. Return JSON."
+        prompt = f"Extract: {kpis}. Return JSON."
         resp = client.models.generate_content(
             model="gemini-2.0-flash-001",
             contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
@@ -251,6 +254,7 @@ def gcs_trigger_handler():
 
         return jsonify({"status": "success"}), 200
     except Exception as e:
+        print(f"❌ Batch Engine Error: {e}")
         return jsonify({"error": str(e)}), 200
 
 # ==========================================
