@@ -15,17 +15,22 @@ from google.genai import types
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
-# 2. Configuration
+# 2. Configuration - DOUBLE CHECK THESE IN GCP CONSOLE
 PROJECT_ID = "pdf-etl-479411"
 DATASET = "etl_reports"
 LOCATION = "us-central1"
-BUCKET_NAME = "pdf_platform_main"
+# Make sure this matches your bucket name exactly
+BUCKET_NAME = "pdf_platform_main" 
 
 # 3. Initialize Google Services
-if not firebase_admin._apps:
-    firebase_admin.initialize_app()
-db = firestore.client()
-client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
+try:
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app()
+    db = firestore.client()
+    client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
+    print(f"✅ Service initialized. Target Bucket: {BUCKET_NAME}")
+except Exception as e:
+    print(f"❌ Initialization Error: {e}")
 
 # ==========================================
 # 🛡️ AUTHENTICATION HELPER
@@ -38,7 +43,8 @@ def get_user_id(req):
         token = auth_header.split("Bearer ")[1]
         decoded_token = auth.verify_id_token(token)
         return decoded_token["uid"]
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ Auth Error: {e}")
         return None
 
 # ==========================================
@@ -89,12 +95,13 @@ def setup_account():
             "account_status": "active",
             "setup_date": datetime.datetime.utcnow()
         }, merge=True)
-        return jsonify({"status": "success", "message": "Ready"}), 200
+        return jsonify({"status": "success", "uid": uid}), 200
     except Exception as e:
+        print(f"❌ Account Setup Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 📂 2. DYNAMIC FOLDER CREATION
+# 📂 2. DYNAMIC FOLDER CREATION (FIXED)
 # ==========================================
 @app.route("/create-folder", methods=["POST", "OPTIONS"])
 def create_folder():
@@ -104,28 +111,43 @@ def create_folder():
     
     try:
         payload = request.get_json()
-        name = payload.get("name") # Matches Lovable's update
+        name = payload.get("name")
         folder_id = re.sub(r'[^a-zA-Z0-9_]', '_', name).lower()
 
+        # 1. Create Folders in Storage
         storage_client = storage.Client()
         bucket = storage_client.bucket(BUCKET_NAME)
         
-        bucket.blob(f"incoming/{uid}/{folder_id}/master/.placeholder").upload_from_string("init")
-        bucket.blob(f"incoming/{uid}/{folder_id}/batch/.placeholder").upload_from_string("init")
+        # Check if bucket exists first
+        if not bucket.exists():
+            print(f"❌ Error: Bucket {BUCKET_NAME} does not exist!")
+            return jsonify({"error": f"Bucket {BUCKET_NAME} not found"}), 500
 
+        # Upload placeholders
+        m_path = f"incoming/{uid}/{folder_id}/master/.placeholder"
+        b_path = f"incoming/{uid}/{folder_id}/batch/.placeholder"
+        
+        bucket.blob(m_path).upload_from_string("init")
+        bucket.blob(b_path).upload_from_string("init")
+        print(f"✅ Created Storage paths for {folder_id}")
+
+        # 2. Update Firestore
         db.collection("tenants").document(uid).collection("folders").document(folder_id).set({
-            "display_name": name, # Matches Lovable's update
+            "display_name": name,
             "folder_id": folder_id,
             "is_trained": False,
             "status": "waiting_for_training",
             "created_at": datetime.datetime.utcnow()
         })
+        print(f"✅ Updated Firestore for {folder_id}")
+
         return jsonify({"status": "success", "folder_id": folder_id}), 200
     except Exception as e:
+        print(f"❌ Create Folder Failed: {e}")
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 🧠 3. MASTER PDF ANALYSIS (TRAINING)
+# 🧠 3. MASTER PDF ANALYSIS
 # ==========================================
 @app.route("/analyze-master", methods=["POST", "OPTIONS"])
 def analyze_master():
@@ -141,7 +163,7 @@ def analyze_master():
         blob = storage_client.bucket(BUCKET_NAME).blob(file_path)
         pdf_bytes = blob.download_as_bytes()
 
-        prompt = "Analyze this PDF. List fields found. Return ONLY JSON {field: example}."
+        prompt = "List data labels in this PDF. Return ONLY JSON {field: example}."
         resp = client.models.generate_content(
             model="gemini-2.0-flash-001",
             contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
@@ -223,7 +245,6 @@ def gcs_trigger_handler():
 
         bigquery.Client().insert_rows_json(table_id, [row])
         
-        # Archive
         new_path = file_path.replace("incoming/", "processed/")
         storage_client.bucket(BUCKET_NAME).copy_blob(blob, storage_client.bucket(BUCKET_NAME), new_path)
         blob.delete()
@@ -233,7 +254,7 @@ def gcs_trigger_handler():
         return jsonify({"error": str(e)}), 200
 
 # ==========================================
-# 📈 6. NEW: FETCH RESULTS (FOR DASHBOARD)
+# 📈 6. FETCH RESULTS API
 # ==========================================
 @app.route("/get-results", methods=["GET", "OPTIONS"])
 def get_results():
@@ -256,8 +277,7 @@ def get_results():
         
         return jsonify({"results": results}), 200
     except Exception as e:
-        # Return empty list if table doesn't exist yet
-        return jsonify({"results": [], "message": str(e)}), 200
+        return jsonify({"results": []}), 200
 
 # --- CORS PREFLIGHT ---
 def _build_cors_preflight_response():
