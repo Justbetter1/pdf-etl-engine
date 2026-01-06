@@ -9,11 +9,12 @@ from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 from google.cloud import storage, bigquery
 from google import genai
-# Note: Ensure google-genai is in your requirements.txt
 from google.genai import types
 
-# 1. Initialize Flask & Global CORS
+# 1. Initialize Flask
 app = Flask(__name__)
+
+# 2. Strong CORS Configuration (Matches the handshake seen in your logs)
 CORS(app, resources={r"/*": {
     "origins": "*",
     "allow_headers": ["Authorization", "Content-Type", "Accept"],
@@ -21,18 +22,17 @@ CORS(app, resources={r"/*": {
     "max_age": 3600
 }}, supports_credentials=True)
 
-# 2. Configuration
+# 3. Configuration
 PROJECT_ID = "pdf-etl-479411"
 DATASET = "etl_reports"
 LOCATION = "us-central1"
 BUCKET_NAME = "pdf_platform_main" 
 
-# 3. Initialize Google Services
+# 4. Initialize Google Services
 try:
     if not firebase_admin._apps:
         firebase_admin.initialize_app()
     db = firestore.client()
-    # Initialize the Gemini 2.0 Client
     client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
     print(f"🚀 Backend fully operational. Project: {PROJECT_ID}")
 except Exception as e:
@@ -44,14 +44,13 @@ except Exception as e:
 def get_user_id(req):
     auth_header = req.headers.get("Authorization")
     if not auth_header:
-        print("❌ Auth Error: Missing Header")
         return None
     try:
         token = auth_header.split("Bearer ")[1]
         decoded_token = auth.verify_id_token(token)
         return decoded_token["uid"]
     except Exception as e:
-        print(f"❌ Auth Error: Invalid Token: {e}")
+        print(f"❌ Auth Error: {e}")
         return None
 
 # ==========================================
@@ -92,12 +91,9 @@ def sync_bigquery_schema(uid, folder_id, kpi_list):
 # ==========================================
 @app.route("/setup-account", methods=["POST", "OPTIONS"])
 def setup_account():
-    if request.method == "OPTIONS": 
-        return _build_cors_preflight_response()
-    
+    if request.method == "OPTIONS": return _build_cors_preflight_response()
     uid = get_user_id(request)
-    if not uid: 
-        return jsonify({"error": "Unauthorized"}), 401
+    if not uid: return jsonify({"error": "Unauthorized"}), 401
     
     try:
         db.collection("tenants").document(uid).set({
@@ -110,33 +106,28 @@ def setup_account():
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 📂 2. DYNAMIC FOLDER CREATION (The fixed route)
+# 📂 2. DYNAMIC FOLDER CREATION
 # ==========================================
 @app.route("/create-folder", methods=["POST", "GET", "OPTIONS"])
 def create_folder():
-    if request.method == "OPTIONS": 
-        return _build_cors_preflight_response()
+    if request.method == "OPTIONS": return _build_cors_preflight_response()
     
-    # Block GET requests but return a helpful message instead of crashing
+    # Prevents the GET 405 error seen in your logs
     if request.method == "GET":
-        return jsonify({"error": "This endpoint requires a POST request with folder details"}), 405
+        return jsonify({"error": "Method Not Allowed. Use POST."}), 405
 
     uid = get_user_id(request)
-    if not uid: 
-        return jsonify({"error": "Unauthorized"}), 401
+    if not uid: return jsonify({"error": "Unauthorized"}), 401
     
     try:
         payload = request.get_json()
         name = payload.get("name")
-        if not name:
-            return jsonify({"error": "Folder name is required"}), 400
-            
         folder_id = re.sub(r'[^a-zA-Z0-9_]', '_', name).lower()
 
         storage_client = storage.Client()
         bucket = storage_client.bucket(BUCKET_NAME)
         
-        # Create folder structure with hidden placeholders
+        # Create storage structure
         bucket.blob(f"incoming/{uid}/{folder_id}/master/.placeholder").upload_from_string("init")
         bucket.blob(f"incoming/{uid}/{folder_id}/batch/.placeholder").upload_from_string("init")
 
@@ -152,7 +143,6 @@ def create_folder():
 
         return jsonify({"status": "success", "folder_id": folder_id, "folder": folder_data}), 200
     except Exception as e:
-        print(f"❌ Folder Creation Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
@@ -160,12 +150,9 @@ def create_folder():
 # ==========================================
 @app.route("/analyze-master", methods=["POST", "OPTIONS"])
 def analyze_master():
-    if request.method == "OPTIONS": 
-        return _build_cors_preflight_response()
-        
+    if request.method == "OPTIONS": return _build_cors_preflight_response()
     uid = get_user_id(request)
-    if not uid: 
-        return jsonify({"error": "Unauthorized"}), 401
+    if not uid: return jsonify({"error": "Unauthorized"}), 401
     
     payload = request.get_json()
     file_path = payload.get("file_path") 
@@ -175,22 +162,15 @@ def analyze_master():
         blob = storage_client.bucket(BUCKET_NAME).blob(file_path)
         pdf_bytes = blob.download_as_bytes()
 
-        # Prompt for Gemini 2.0
-        prompt = "Identify data labels in this PDF document. Return ONLY a JSON object where keys are the labels and values are examples from the text."
-        
+        prompt = "Identify data labels in this PDF. Return ONLY JSON {field: example}."
         resp = client.models.generate_content(
             model="gemini-2.0-flash-001",
             contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
             config=types.GenerateContentConfig(response_mime_type="application/json"),
         )
-        
-        # Clean the response text from any markdown blocks
-        clean_json = re.sub(r'^```json\s*|```$', '', resp.text.strip(), flags=re.MULTILINE)
-        detected_data = json.loads(clean_json)
-        
+        detected_data = json.loads(re.sub(r'^```json\s*|```$', '', resp.text.strip(), flags=re.MULTILINE))
         return jsonify({"detected_kpis": detected_data}), 200
     except Exception as e:
-        print(f"❌ Analysis Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
@@ -198,13 +178,10 @@ def analyze_master():
 # ==========================================
 @app.route("/confirm-kpis", methods=["POST", "OPTIONS"])
 def confirm_kpis():
-    if request.method == "OPTIONS": 
-        return _build_cors_preflight_response()
-        
+    if request.method == "OPTIONS": return _build_cors_preflight_response()
     uid = get_user_id(request)
-    if not uid:
-        return jsonify({"error": "Unauthorized"}), 401
-
+    if not uid: return jsonify({"error": "Unauthorized"}), 401
+    
     payload = request.get_json()
     folder_id = payload.get("folder_id")
     selected_kpis = payload.get("selected_kpis")
@@ -215,7 +192,6 @@ def confirm_kpis():
             "is_trained": True,
             "status": "active"
         })
-        # Prepare the BigQuery table for this user/folder
         sync_bigquery_schema(uid, folder_id, selected_kpis)
         return jsonify({"status": "success"}), 200
     except Exception as e:
@@ -226,19 +202,14 @@ def confirm_kpis():
 # ==========================================
 @app.route("/", methods=["POST", "OPTIONS"])
 def gcs_trigger_handler():
-    if request.method == "OPTIONS": 
-        return _build_cors_preflight_response()
-    
+    if request.method == "OPTIONS": return _build_cors_preflight_response()
     payload = request.get_json(silent=True) or {}
-    # Extract GCS event data
     data = payload.get("data", payload)
     file_path = data.get("name", "")
 
-    # Ignore non-PDF or system files
     if not file_path.lower().endswith(".pdf") or ".placeholder" in file_path:
         return jsonify({"status": "ignored"}), 200
 
-    # Path structure: incoming/{uid}/{folder_id}/batch/{filename}
     parts = file_path.split("/")
     if len(parts) < 5 or parts[3] != "batch":
         return jsonify({"status": "ignored_path"}), 200
@@ -247,11 +218,8 @@ def gcs_trigger_handler():
 
     try:
         folder_ref = db.collection("tenants").document(uid).collection("folders").document(folder_id).get()
-        if not folder_ref.exists:
-            return jsonify({"status": "folder_not_found"}), 200
-            
         folder_data = folder_ref.to_dict()
-        if not folder_data.get("is_trained"):
+        if not folder_ref.exists or not folder_data.get("is_trained"):
             return jsonify({"status": "waiting_for_training"}), 200
 
         kpis = folder_data.get("selected_kpis", [])
@@ -259,18 +227,14 @@ def gcs_trigger_handler():
         blob = storage_client.bucket(BUCKET_NAME).blob(file_path)
         pdf_bytes = blob.download_as_bytes()
 
-        # Run Extraction
-        prompt = f"Extract the following fields from this document: {kpis}. Return the results in a flat JSON format."
+        prompt = f"Extract: {kpis}. Return JSON."
         resp = client.models.generate_content(
             model="gemini-2.0-flash-001",
             contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
             config=types.GenerateContentConfig(response_mime_type="application/json"),
         )
-        
-        clean_json = re.sub(r'^```json\s*|```$', '', resp.text.strip(), flags=re.MULTILINE)
-        extracted = json.loads(clean_json)
+        extracted = json.loads(re.sub(r'^```json\s*|```$', '', resp.text.strip(), flags=re.MULTILINE))
 
-        # Sync to BigQuery
         table_id = sync_bigquery_schema(uid, folder_id, kpis)
         row = {
             "row_id": f"row_{int(time.time())}",
@@ -283,14 +247,12 @@ def gcs_trigger_handler():
 
         bigquery.Client().insert_rows_json(table_id, [row])
         
-        # Move file to 'processed' folder
         new_path = file_path.replace("incoming/", "processed/")
         storage_client.bucket(BUCKET_NAME).copy_blob(blob, storage_client.bucket(BUCKET_NAME), new_path)
         blob.delete()
 
         return jsonify({"status": "success"}), 200
     except Exception as e:
-        print(f"❌ Batch Engine Error: {e}")
         return jsonify({"error": str(e)}), 200
 
 # ==========================================
@@ -298,16 +260,12 @@ def gcs_trigger_handler():
 # ==========================================
 @app.route("/get-results", methods=["GET", "OPTIONS"])
 def get_results():
-    if request.method == "OPTIONS": 
-        return _build_cors_preflight_response()
-        
+    if request.method == "OPTIONS": return _build_cors_preflight_response()
     uid = get_user_id(request)
-    if not uid: 
-        return jsonify({"error": "Unauthorized"}), 401
+    if not uid: return jsonify({"error": "Unauthorized"}), 401
     
     folder_id = request.args.get("folder_id")
-    if not folder_id: 
-        return jsonify({"error": "folder_id required"}), 400
+    if not folder_id: return jsonify({"error": "folder_id required"}), 400
 
     try:
         bq_client = bigquery.Client()
@@ -321,18 +279,14 @@ def get_results():
         
         return jsonify({"results": results}), 200
     except Exception as e:
-        # If table doesn't exist yet, return empty list
         return jsonify({"results": []}), 200
 
-# ==========================================
-# 🛠️ CORS PREFLIGHT BUILDER
-# ==========================================
+# --- CORS PREFLIGHT ---
 def _build_cors_preflight_response():
     response = make_response()
     response.headers.add("Access-Control-Allow-Origin", "*")
     response.headers.add("Access-Control-Allow-Headers", "Content-Type,Authorization,Accept")
     response.headers.add("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-    response.headers.add("Access-Control-Max-Age", "3600")
     return response, 204
 
 if __name__ == "__main__":
