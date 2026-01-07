@@ -14,7 +14,7 @@ from google.genai import types
 # 1. Initialize Flask
 app = Flask(__name__)
 
-# 2. Strong CORS Configuration (Matches the handshake seen in your logs)
+# 2. Strong CORS Configuration
 CORS(app, resources={r"/*": {
     "origins": "*",
     "allow_headers": ["Authorization", "Content-Type", "Accept"],
@@ -112,7 +112,6 @@ def setup_account():
 def create_folder():
     if request.method == "OPTIONS": return _build_cors_preflight_response()
     
-    # Prevents the GET 405 error seen in your logs
     if request.method == "GET":
         return jsonify({"error": "Method Not Allowed. Use POST."}), 405
 
@@ -127,7 +126,6 @@ def create_folder():
         storage_client = storage.Client()
         bucket = storage_client.bucket(BUCKET_NAME)
         
-        # Create storage structure
         bucket.blob(f"incoming/{uid}/{folder_id}/master/.placeholder").upload_from_string("init")
         bucket.blob(f"incoming/{uid}/{folder_id}/batch/.placeholder").upload_from_string("init")
 
@@ -182,11 +180,16 @@ def confirm_kpis():
     uid = get_user_id(request)
     if not uid: return jsonify({"error": "Unauthorized"}), 401
     
-    payload = request.get_json()
-    folder_id = payload.get("folder_id")
-    selected_kpis = payload.get("selected_kpis")
-
     try:
+        payload = request.get_json()
+        print(f"DEBUG Payload: {payload}") # Helps check logs if 500 error occurs
+        
+        folder_id = payload.get("folder_id")
+        selected_kpis = payload.get("selected_kpis")
+
+        if not folder_id or not selected_kpis:
+            return jsonify({"error": "Missing folder_id or selected_kpis"}), 400
+
         db.collection("tenants").document(uid).collection("folders").document(folder_id).update({
             "selected_kpis": selected_kpis,
             "is_trained": True,
@@ -195,6 +198,7 @@ def confirm_kpis():
         sync_bigquery_schema(uid, folder_id, selected_kpis)
         return jsonify({"status": "success"}), 200
     except Exception as e:
+        print(f"❌ Confirm KPIs Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
@@ -227,7 +231,7 @@ def gcs_trigger_handler():
         blob = storage_client.bucket(BUCKET_NAME).blob(file_path)
         pdf_bytes = blob.download_as_bytes()
 
-        prompt = f"Extract: {kpis}. Return JSON."
+        prompt = f"Extract values for these labels: {kpis}. Return JSON."
         resp = client.models.generate_content(
             model="gemini-2.0-flash-001",
             contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
@@ -281,12 +285,12 @@ def get_results():
     except Exception as e:
         return jsonify({"results": []}), 200
 
-# --- CORS PREFLIGHT ---
 def _build_cors_preflight_response():
     response = make_response()
     response.headers.add("Access-Control-Allow-Origin", "*")
     response.headers.add("Access-Control-Allow-Headers", "Content-Type,Authorization,Accept")
     response.headers.add("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+    response.headers.add("Access-Control-Max-Age", "3600")
     return response, 204
 
 if __name__ == "__main__":
