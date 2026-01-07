@@ -126,7 +126,6 @@ def create_folder():
         storage_client = storage.Client()
         bucket = storage_client.bucket(BUCKET_NAME)
         
-        # Create storage placeholders
         bucket.blob(f"incoming/{uid}/{folder_id}/master/.placeholder").upload_from_string("init")
         bucket.blob(f"incoming/{uid}/{folder_id}/batch/.placeholder").upload_from_string("init")
 
@@ -145,7 +144,7 @@ def create_folder():
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 🧠 3. MASTER PDF ANALYSIS
+# 🧠 3. MASTER PDF ANALYSIS (UPDATED FOR LOVABLE)
 # ==========================================
 @app.route("/analyze-master", methods=["POST", "OPTIONS"])
 def analyze_master():
@@ -167,8 +166,14 @@ def analyze_master():
             contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
             config=types.GenerateContentConfig(response_mime_type="application/json"),
         )
-        detected_data = json.loads(re.sub(r'^```json\s*|```$', '', resp.text.strip(), flags=re.MULTILINE))
-        return jsonify({"detected_kpis": detected_data}), 200
+        # Clean the JSON response
+        raw_text = re.sub(r'^```json\s*|```$', '', resp.text.strip(), flags=re.MULTILINE)
+        detected_dict = json.loads(raw_text)
+        
+        # TRANSFORM FOR LOVABLE: Convert {key: val} to [{"key": k, "value": v}]
+        formatted_kpis = [{"key": k, "value": v} for k, v in detected_dict.items()]
+        
+        return jsonify({"detected_kpis": formatted_kpis}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
