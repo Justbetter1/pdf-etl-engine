@@ -126,6 +126,7 @@ def create_folder():
         storage_client = storage.Client()
         bucket = storage_client.bucket(BUCKET_NAME)
         
+        # Create storage placeholders
         bucket.blob(f"incoming/{uid}/{folder_id}/master/.placeholder").upload_from_string("init")
         bucket.blob(f"incoming/{uid}/{folder_id}/batch/.placeholder").upload_from_string("init")
 
@@ -182,7 +183,7 @@ def confirm_kpis():
     
     try:
         payload = request.get_json()
-        print(f"DEBUG Payload: {payload}") # Helps check logs if 500 error occurs
+        print(f"DEBUG Payload: {payload}")
         
         folder_id = payload.get("folder_id")
         selected_kpis = payload.get("selected_kpis")
@@ -231,7 +232,7 @@ def gcs_trigger_handler():
         blob = storage_client.bucket(BUCKET_NAME).blob(file_path)
         pdf_bytes = blob.download_as_bytes()
 
-        prompt = f"Extract values for these labels: {kpis}. Return JSON."
+        prompt = f"Extract values for these labels: {kpis}. Return JSON object where keys are the labels."
         resp = client.models.generate_content(
             model="gemini-2.0-flash-001",
             contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
