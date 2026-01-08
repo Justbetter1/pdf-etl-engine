@@ -119,7 +119,6 @@ def create_folder():
     try:
         payload = request.get_json()
         name = payload.get("name")
-        # Ensure folder_id is strictly lowercase and clean
         folder_id = re.sub(r'[^a-zA-Z0-9_]', '_', name).lower()
 
         storage_client = storage.Client()
@@ -163,7 +162,6 @@ def analyze_master():
         blob = bucket.blob(file_path)
         
         if not blob.exists():
-            print(f"❌ ERROR: File {file_path} not found in {BUCKET_NAME}")
             return jsonify({"error": f"File {file_path} not found"}), 404
 
         pdf_bytes = blob.download_as_bytes()
@@ -178,7 +176,10 @@ def analyze_master():
         raw_text = re.sub(r'^```json\s*|```$', '', resp.text.strip(), flags=re.MULTILINE)
         detected_dict = json.loads(raw_text)
         
-        # Format for Lovable's specific state expectation
+        # CRASH FIX: Ensure detected_dict is a dictionary
+        if isinstance(detected_dict, list):
+            detected_dict = detected_dict[0] if len(detected_dict) > 0 else {}
+        
         formatted_kpis = [{"key": k, "value": v} for k, v in detected_dict.items()]
         
         return jsonify({"detected_kpis": formatted_kpis}), 200
@@ -246,7 +247,12 @@ def gcs_trigger_handler():
             contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
             config=types.GenerateContentConfig(response_mime_type="application/json"),
         )
+        
         extracted = json.loads(re.sub(r'^```json\s*|```$', '', resp.text.strip(), flags=re.MULTILINE))
+
+        # CRASH FIX: Ensure extracted is a dictionary
+        if isinstance(extracted, list):
+            extracted = extracted[0] if len(extracted) > 0 else {}
 
         table_id = sync_bigquery_schema(uid, folder_id, kpis)
         row = {
@@ -266,6 +272,7 @@ def gcs_trigger_handler():
 
         return jsonify({"status": "success"}), 200
     except Exception as e:
+        print(f"❌ Batch Trigger Error: {e}")
         return jsonify({"error": str(e)}), 200
 
 # ==========================================
