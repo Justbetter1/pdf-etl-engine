@@ -111,9 +111,7 @@ def setup_account():
 @app.route("/create-folder", methods=["POST", "GET", "OPTIONS"])
 def create_folder():
     if request.method == "OPTIONS": return _build_cors_preflight_response()
-    
-    if request.method == "GET":
-        return jsonify({"error": "Method Not Allowed. Use POST."}), 405
+    if request.method == "GET": return jsonify({"error": "Use POST"}), 405
 
     uid = get_user_id(request)
     if not uid: return jsonify({"error": "Unauthorized"}), 401
@@ -121,11 +119,13 @@ def create_folder():
     try:
         payload = request.get_json()
         name = payload.get("name")
+        # Ensure folder_id is strictly lowercase and clean
         folder_id = re.sub(r'[^a-zA-Z0-9_]', '_', name).lower()
 
         storage_client = storage.Client()
         bucket = storage_client.bucket(BUCKET_NAME)
         
+        # Initialize storage structure
         bucket.blob(f"incoming/{uid}/{folder_id}/master/.placeholder").upload_from_string("init")
         bucket.blob(f"incoming/{uid}/{folder_id}/batch/.placeholder").upload_from_string("init")
 
@@ -141,10 +141,11 @@ def create_folder():
 
         return jsonify({"status": "success", "folder_id": folder_id, "folder": folder_data}), 200
     except Exception as e:
+        print(f"❌ Create Folder Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 🧠 3. MASTER PDF ANALYSIS (UPDATED FOR LOVABLE)
+# 🧠 3. MASTER PDF ANALYSIS
 # ==========================================
 @app.route("/analyze-master", methods=["POST", "OPTIONS"])
 def analyze_master():
@@ -154,10 +155,17 @@ def analyze_master():
     
     payload = request.get_json()
     file_path = payload.get("file_path") 
+    print(f"🔍 LOG: Checking file at: {file_path}")
 
     try:
         storage_client = storage.Client()
-        blob = storage_client.bucket(BUCKET_NAME).blob(file_path)
+        bucket = storage_client.bucket(BUCKET_NAME)
+        blob = bucket.blob(file_path)
+        
+        if not blob.exists():
+            print(f"❌ ERROR: File {file_path} not found in {BUCKET_NAME}")
+            return jsonify({"error": f"File {file_path} not found"}), 404
+
         pdf_bytes = blob.download_as_bytes()
 
         prompt = "Identify data labels in this PDF. Return ONLY JSON {field: example}."
@@ -166,15 +174,16 @@ def analyze_master():
             contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
             config=types.GenerateContentConfig(response_mime_type="application/json"),
         )
-        # Clean the JSON response
+        
         raw_text = re.sub(r'^```json\s*|```$', '', resp.text.strip(), flags=re.MULTILINE)
         detected_dict = json.loads(raw_text)
         
-        # TRANSFORM FOR LOVABLE: Convert {key: val} to [{"key": k, "value": v}]
+        # Format for Lovable's specific state expectation
         formatted_kpis = [{"key": k, "value": v} for k, v in detected_dict.items()]
         
         return jsonify({"detected_kpis": formatted_kpis}), 200
     except Exception as e:
+        print(f"❌ Analyze Master Crash: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
@@ -188,13 +197,8 @@ def confirm_kpis():
     
     try:
         payload = request.get_json()
-        print(f"DEBUG Payload: {payload}")
-        
         folder_id = payload.get("folder_id")
         selected_kpis = payload.get("selected_kpis")
-
-        if not folder_id or not selected_kpis:
-            return jsonify({"error": "Missing folder_id or selected_kpis"}), 400
 
         db.collection("tenants").document(uid).collection("folders").document(folder_id).update({
             "selected_kpis": selected_kpis,
@@ -204,7 +208,6 @@ def confirm_kpis():
         sync_bigquery_schema(uid, folder_id, selected_kpis)
         return jsonify({"status": "success"}), 200
     except Exception as e:
-        print(f"❌ Confirm KPIs Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
