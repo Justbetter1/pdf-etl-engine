@@ -80,7 +80,6 @@ def sync_bigquery_schema(uid, folder_id, kpi_list):
     new_fields = []
     
     for kpi in kpi_list:
-        # Construct the column name consistently
         col_name = f"kpi_{re.sub(r'[^a-zA-Z0-9_]', '_', kpi).lower()}"
         if col_name not in existing_cols:
             new_fields.append(bigquery.SchemaField(col_name, "STRING"))
@@ -112,7 +111,7 @@ def setup_account():
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 📂 2. DYNAMIC FOLDER CREATION
+# 📂 2. DYNAMIC FOLDER CREATION (UPDATED WITH HINT)
 # ==========================================
 @app.route("/create-folder", methods=["POST", "OPTIONS"])
 def create_folder():
@@ -123,18 +122,19 @@ def create_folder():
     try:
         payload = request.get_json()
         name = payload.get("name")
+        context_hint = payload.get("context_hint", "") # Capture the user's business context
         folder_id = re.sub(r'[^a-zA-Z0-9_]', '_', name).lower()
 
         storage_client = storage.Client()
         bucket = storage_client.bucket(BUCKET_NAME)
         
-        # Initialize storage structure with placeholders
         bucket.blob(f"incoming/{uid}/{folder_id}/master/.placeholder").upload_from_string("init")
         bucket.blob(f"incoming/{uid}/{folder_id}/batch/.placeholder").upload_from_string("init")
 
         folder_data = {
             "display_name": name,
             "folder_id": folder_id,
+            "context_hint": context_hint, # Store hint for future processing
             "is_trained": False,
             "status": "waiting_for_training",
             "created_at": datetime.datetime.utcnow().isoformat(),
@@ -148,7 +148,7 @@ def create_folder():
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 🧠 3. MASTER PDF ANALYSIS
+# 🧠 3. MASTER PDF ANALYSIS (UPDATED WITH HINT & TEMP 0)
 # ==========================================
 @app.route("/analyze-master", methods=["POST", "OPTIONS"])
 def analyze_master():
@@ -158,7 +158,9 @@ def analyze_master():
     
     payload = request.get_json()
     file_path = payload.get("file_path") 
-    print(f"🔍 LOG: Analyzing master file: {file_path}")
+    context_hint = payload.get("context_hint", "") # Receive hint from frontend
+    
+    print(f"🔍 LOG: Analyzing master with context: {context_hint}")
 
     try:
         storage_client = storage.Client()
@@ -170,16 +172,23 @@ def analyze_master():
 
         pdf_bytes = blob.download_as_bytes()
 
-        # Enhanced prompt for strict JSON and multi-PDF support
-        prompt = "Extract all data labels and headers found in this document. Return ONLY a valid JSON object of {field_name: example_value}. Ensure keys are descriptive."
+        # Context-aware prompt
+        prompt = f"""
+        Extract all data labels and headers found in this document. 
+        USER CONTEXT: {context_hint if context_hint else "Generic business document."}
+        Return ONLY a valid JSON object of {{field_name: example_value}}. 
+        Ensure keys are descriptive and relevant to the provided USER CONTEXT.
+        """
         
         resp = client.models.generate_content(
             model="gemini-2.0-flash-001",
             contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.0 # Fixes accuracy issues
+            ),
         )
         
-        # Clean JSON from markdown if necessary
         raw_text = resp.text.strip()
         if raw_text.startswith("```"):
             raw_text = re.sub(r'^```json\s*|```$', '', raw_text, flags=re.MULTILINE)
@@ -215,7 +224,6 @@ def confirm_kpis():
             "status": "active"
         })
         
-        # Create/Update BigQuery Table
         sync_bigquery_schema(uid, folder_id, selected_kpis)
         
         return jsonify({"status": "success"}), 200
@@ -224,7 +232,7 @@ def confirm_kpis():
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 🚜 5. BATCH ENGINE (GCS TRIGGER HANDLER)
+# 🚜 5. BATCH ENGINE (GCS TRIGGER HANDLER - UPDATED WITH HINT & TEMP 0)
 # ==========================================
 @app.route("/", methods=["POST", "OPTIONS"])
 def gcs_trigger_handler():
@@ -234,12 +242,10 @@ def gcs_trigger_handler():
     data = payload.get("data", payload)
     file_path = data.get("name", "")
 
-    # CRITICAL FIX: Ignore files already in processed or placeholders
     if "processed/" in file_path or ".placeholder" in file_path or not file_path.lower().endswith(".pdf"):
         return jsonify({"status": "ignored"}), 200
 
     parts = file_path.split("/")
-    # Expected: incoming/{uid}/{folder_id}/batch/{filename}
     if len(parts) < 5 or parts[0] != "incoming" or parts[3] != "batch":
         return jsonify({"status": "ignored_path"}), 200
     
@@ -247,25 +253,34 @@ def gcs_trigger_handler():
     folder_id = parts[2]
 
     try:
-        # 1. Get training data from Firestore
+        # 1. Get training data AND context hint from Firestore
         folder_ref = db.collection("tenants").document(uid).collection("folders").document(folder_id).get()
         if not folder_ref.exists:
             return jsonify({"error": "Folder not trained"}), 200
             
         folder_data = folder_ref.to_dict()
         kpis = folder_data.get("selected_kpis", [])
+        context_hint = folder_data.get("context_hint", "")
 
-        # 2. Extract data using Gemini
+        # 2. Extract data using Gemini with specific context
         storage_client = storage.Client()
         source_bucket = storage_client.bucket(BUCKET_NAME)
         blob = source_bucket.blob(file_path)
         pdf_bytes = blob.download_as_bytes()
 
-        prompt = f"Extract the values for these specific keys: {kpis}. Return ONLY a JSON object."
+        prompt = f"""
+        Extract the values for these specific keys: {kpis}. 
+        CONTEXT: {context_hint if context_hint else "Generic data extraction."}
+        Return ONLY a JSON object. If a value is missing, return "N/A".
+        """
+        
         resp = client.models.generate_content(
             model="gemini-2.0-flash-001",
             contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.0 # Force robot-like consistency
+            ),
         )
         
         raw_extract = resp.text.strip()
@@ -284,7 +299,6 @@ def gcs_trigger_handler():
             "uploaded_at": datetime.datetime.utcnow().isoformat()
         }
         
-        # Map extracted data to BigQuery kpi_ columns
         for k in kpis:
             safe_col_name = f"kpi_{re.sub(r'[^a-zA-Z0-9_]', '_', k).lower()}"
             row[safe_col_name] = str(extracted_data.get(k, "N/A"))
@@ -296,7 +310,7 @@ def gcs_trigger_handler():
             print(f"❌ BigQuery Insert Errors: {errors}")
             return jsonify({"error": "BigQuery Insert Failed"}), 200
 
-        # 4. Move file to processed (This prevents re-triggering due to the check at start)
+        # 4. Move file to processed
         new_path = file_path.replace("incoming/", "processed/")
         source_bucket.copy_blob(blob, source_bucket, new_path)
         blob.delete()
