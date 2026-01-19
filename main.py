@@ -75,6 +75,47 @@ def _build_cors_preflight_response():
     return response, 204
 
 # ==========================================
+# 🔍 KPI TYPE INFERENCE HELPER
+# ==========================================
+def infer_kpi_type(value):
+    """Infer the data type of a KPI based on its sample value."""
+    if value is None or value == "" or value == "N/A":
+        return "string"
+    
+    val_str = str(value).strip()
+    
+    # Check for number (integer or float)
+    try:
+        float(val_str.replace(",", "").replace("$", "").replace("%", ""))
+        return "number"
+    except ValueError:
+        pass
+    
+    # Check for date patterns
+    date_patterns = [
+        r'^\d{4}-\d{2}-\d{2}$',           # 2024-01-15
+        r'^\d{2}/\d{2}/\d{4}$',           # 01/15/2024
+        r'^\d{2}-\d{2}-\d{4}$',           # 15-01-2024
+        r'^\d{1,2}\s+\w+\s+\d{4}$',       # 15 January 2024
+        r'^\w+\s+\d{1,2},?\s+\d{4}$',     # January 15, 2024
+    ]
+    for pattern in date_patterns:
+        if re.match(pattern, val_str, re.IGNORECASE):
+            return "date"
+    
+    # Check for categorical (short string with limited unique values pattern)
+    # Heuristic: if it's a short uppercase/titlecase word or known status
+    categorical_indicators = [
+        "active", "inactive", "pending", "approved", "rejected", "completed",
+        "yes", "no", "true", "false", "open", "closed", "paid", "unpaid",
+        "high", "medium", "low", "male", "female", "new", "used"
+    ]
+    if val_str.lower() in categorical_indicators or (len(val_str) < 20 and val_str.replace(" ", "").isalpha()):
+        return "categorical"
+    
+    return "string"
+
+# ==========================================
 # 📊 BIGQUERY SCHEMA SYNC & TABLE CREATION
 # ==========================================
 def sync_bigquery_schema(uid, folder_id, kpi_list):
@@ -236,9 +277,11 @@ def confirm_kpis():
         payload = request.get_json()
         folder_id = payload.get("folder_id")
         selected_kpis = payload.get("selected_kpis")
+        kpi_samples = payload.get("kpi_samples", {})  # NEW: receive samples from frontend
 
         db.collection("tenants").document(uid).collection("folders").document(folder_id).update({
             "selected_kpis": selected_kpis,
+            "kpi_samples": kpi_samples,  # NEW: store samples for type inference
             "is_trained": True,
             "status": "active"
         })
@@ -251,7 +294,7 @@ def confirm_kpis():
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 📋 5. GET KPIs (for shared folder status)
+# 📋 5. GET KPIs (with type metadata)
 # ==========================================
 @app.route("/get-kpis", methods=["GET", "OPTIONS"])
 def get_kpis():
@@ -275,27 +318,20 @@ def get_kpis():
         folder_data = folder_ref.to_dict()
         
         # Permission check: must be owner or have a share document
-        # For shared users, we check the global shares collection
         is_owner = uid == folder_data.get("owner")
         has_share = False
         
         if not is_owner:
-            # Check global shares collection for this user
             shares_query = db.collection("shares").where("folderId", "==", folder_id).where("ownerId", "==", target_uid).get()
             for share_doc in shares_query:
                 share_data = share_doc.to_dict()
-                # Match by email from the token (you may need to get email from token)
-                # For simplicity, we also check shared_with map if it exists
                 if uid in folder_data.get("shared_with", {}):
                     has_share = True
                     break
-            # Also accept if shared_with map contains uid
             if uid in folder_data.get("shared_with", {}):
                 has_share = True
         
         if not is_owner and not has_share:
-            # Fallback: allow if there's any share doc for this folder (looser check)
-            # This handles email-based sharing where we can't easily match uid
             shares_query = db.collection("shares").where("folderId", "==", folder_id).where("ownerId", "==", target_uid).get()
             if len(list(shares_query)) > 0:
                 has_share = True
@@ -303,9 +339,23 @@ def get_kpis():
         if not is_owner and not has_share:
             return jsonify({"error": "Access denied"}), 403
         
+        # Build KPI metadata with types
+        selected_kpis_raw = folder_data.get("selected_kpis", [])
+        kpi_samples = folder_data.get("kpi_samples", {})
+        
+        selected_kpis_with_types = []
+        for kpi_name in selected_kpis_raw:
+            sample_value = kpi_samples.get(kpi_name, "")
+            kpi_type = infer_kpi_type(sample_value)
+            selected_kpis_with_types.append({
+                "name": kpi_name,
+                "sample_value": sample_value,
+                "type": kpi_type
+            })
+        
         return jsonify({
             "is_trained": folder_data.get("is_trained", False),
-            "selected_kpis": folder_data.get("selected_kpis", []),
+            "selected_kpis": selected_kpis_with_types,  # Now includes type metadata
             "context_hint": folder_data.get("context_hint", ""),
             "status": folder_data.get("status", "unknown")
         }), 200
@@ -328,7 +378,6 @@ def upload_batch_file():
         return jsonify({"error": "Unauthorized"}), 401
 
     try:
-        # Get form data
         folder_id = request.form.get("folder_id")
         owner_id = request.form.get("owner_id")
         file = request.files.get("file")
@@ -336,15 +385,12 @@ def upload_batch_file():
         if not folder_id or not owner_id or not file:
             return jsonify({"error": "Missing required fields: folder_id, owner_id, or file"}), 400
 
-        # Validate file is PDF
         if not file.filename.lower().endswith('.pdf'):
             return jsonify({"error": "Only PDF files are allowed"}), 400
 
-        # Sanitize email for document ID lookup
         sanitized_email = re.sub(r'[@.]', '_', user_email)
         share_doc_id = f"{owner_id}_{folder_id}_{sanitized_email}"
 
-        # Verify share permission in Firestore
         share_ref = db.collection("shares").document(share_doc_id).get()
 
         if not share_ref.exists:
@@ -356,17 +402,14 @@ def upload_batch_file():
         if permission != "edit":
             return jsonify({"error": "You have view-only access. Upload not permitted."}), 403
 
-        # Sanitize filename
         original_filename = file.filename or "unnamed.pdf"
         sanitized_filename = re.sub(r'[^a-zA-Z0-9_.-]', '_', original_filename)
 
-        # Upload to Firebase Storage with admin privileges
         storage_path = f"incoming/{owner_id}/{folder_id}/batch/{sanitized_filename}"
         storage_client = storage.Client()
         bucket = storage_client.bucket(BUCKET_NAME)
         blob = bucket.blob(storage_path)
         
-        # Upload file content
         blob.upload_from_file(file, content_type="application/pdf")
 
         print(f"✅ Shared user {user_email} uploaded {sanitized_filename} to {storage_path}")
@@ -479,12 +522,11 @@ def get_results():
     if not uid: return jsonify({"error": "Unauthorized"}), 401
     
     folder_id = request.args.get("folder_id")
-    owner_id = request.args.get("owner_id")  # NEW: accept owner_id for shared folders
+    owner_id = request.args.get("owner_id")
     
     if not folder_id: return jsonify({"error": "folder_id required"}), 400
 
     try:
-        # Use owner_id if provided (shared folder case), otherwise use requesting user
         target_uid = owner_id if owner_id else uid
         
         folder_ref = db.collection("tenants").document(target_uid).collection("folders").document(folder_id).get()
@@ -493,7 +535,6 @@ def get_results():
         if folder_ref.exists:
             folder_data = folder_ref.to_dict()
         else:
-            # Fallback: search for the folder across tenants (shared case)
             tenants = db.collection("tenants").stream()
             for tenant in tenants:
                 f_ref = db.collection("tenants").document(tenant.id).collection("folders").document(folder_id).get()
@@ -508,9 +549,7 @@ def get_results():
 
         owner_uid = folder_data["owner"]
 
-        # Permission check
         if not (uid == owner_uid or uid in folder_data.get("shared_with", {})):
-            # Also check global shares collection
             shares_query = db.collection("shares").where("folderId", "==", folder_id).where("ownerId", "==", owner_uid).get()
             has_share = len(list(shares_query)) > 0
             if not has_share:
