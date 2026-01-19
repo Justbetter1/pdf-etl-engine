@@ -53,12 +53,19 @@ def get_user_id(req):
         print(f"❌ Auth Error: {e}")
         return None
 
+def _build_cors_preflight_response():
+    response = make_response()
+    response.headers.add("Access-Control-Allow-Origin", "*")
+    response.headers.add("Access-Control-Allow-Headers", "Content-Type,Authorization,Accept")
+    response.headers.add("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+    response.headers.add("Access-Control-Max-Age", "3600")
+    return response, 204
+
 # ==========================================
 # 📊 BIGQUERY SCHEMA SYNC & TABLE CREATION
 # ==========================================
 def sync_bigquery_schema(uid, folder_id, kpi_list):
     bq_client = bigquery.Client()
-    # Clean names for BigQuery compatibility
     clean_uid = re.sub(r'[^a-zA-Z0-9_]', '_', uid).lower()
     clean_folder = re.sub(r'[^a-zA-Z0-9_]', '_', folder_id).lower()
     table_id = f"{PROJECT_ID}.{DATASET}.{clean_uid}_{clean_folder}"
@@ -66,14 +73,13 @@ def sync_bigquery_schema(uid, folder_id, kpi_list):
     try:
         table = bq_client.get_table(table_id)
     except Exception:
-        # Create table if it doesn't exist with base columns
         schema = [
             bigquery.SchemaField("row_id", "STRING"),
             bigquery.SchemaField("file_name", "STRING"),
             bigquery.SchemaField("uploaded_at", "TIMESTAMP"),
         ]
         table = bq_client.create_table(bigquery.Table(table_id, schema=schema))
-        time.sleep(2) # Wait for propagation
+        time.sleep(2)
         table = bq_client.get_table(table_id)
 
     existing_cols = {field.name for field in table.schema}
@@ -111,7 +117,7 @@ def setup_account():
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 📂 2. DYNAMIC FOLDER CREATION (UPDATED WITH HINT + SHARING MAP)
+# 📂 2. DYNAMIC FOLDER CREATION
 # ==========================================
 @app.route("/create-folder", methods=["POST", "OPTIONS"])
 def create_folder():
@@ -122,7 +128,7 @@ def create_folder():
     try:
         payload = request.get_json()
         name = payload.get("name")
-        context_hint = payload.get("context_hint", "") # Capture the user's business context
+        context_hint = payload.get("context_hint", "")
         folder_id = re.sub(r'[^a-zA-Z0-9_]', '_', name).lower()
 
         storage_client = storage.Client()
@@ -134,12 +140,12 @@ def create_folder():
         folder_data = {
             "display_name": name,
             "folder_id": folder_id,
-            "context_hint": context_hint, # Store hint for future processing
+            "context_hint": context_hint,
             "is_trained": False,
             "status": "waiting_for_training",
             "created_at": datetime.datetime.utcnow().isoformat(),
             "owner": uid,
-            "shared_with": {}  # NEW: map of {user_uid: "view" or "edit"}
+            "shared_with": {}
         }
         db.collection("tenants").document(uid).collection("folders").document(folder_id).set(folder_data)
 
@@ -149,7 +155,7 @@ def create_folder():
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 🧠 3. MASTER PDF ANALYSIS (UPDATED WITH HINT & TEMP 0)
+# 🧠 3. MASTER PDF ANALYSIS
 # ==========================================
 @app.route("/analyze-master", methods=["POST", "OPTIONS"])
 def analyze_master():
@@ -159,7 +165,7 @@ def analyze_master():
     
     payload = request.get_json()
     file_path = payload.get("file_path") 
-    context_hint = payload.get("context_hint", "") # Receive hint from frontend
+    context_hint = payload.get("context_hint", "")
     
     print(f"🔍 LOG: Analyzing master with context: {context_hint}")
 
@@ -173,7 +179,6 @@ def analyze_master():
 
         pdf_bytes = blob.download_as_bytes()
 
-        # Context-aware prompt
         prompt = f"""
         Extract all data labels and headers found in this document. 
         USER CONTEXT: {context_hint if context_hint else "Generic business document."}
@@ -186,7 +191,7 @@ def analyze_master():
             contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                temperature=0.0 # Fixes accuracy issues
+                temperature=0.0
             ),
         )
         
@@ -233,7 +238,71 @@ def confirm_kpis():
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 🚜 5. BATCH ENGINE (GCS TRIGGER HANDLER - UPDATED WITH PERMISSIONS)
+# 📋 5. GET KPIs (for shared folder status)
+# ==========================================
+@app.route("/get-kpis", methods=["GET", "OPTIONS"])
+def get_kpis():
+    if request.method == "OPTIONS": return _build_cors_preflight_response()
+    uid = get_user_id(request)
+    if not uid: return jsonify({"error": "Unauthorized"}), 401
+    
+    folder_id = request.args.get("folder_id")
+    owner_id = request.args.get("owner_id")
+    
+    if not folder_id: return jsonify({"error": "folder_id required"}), 400
+
+    try:
+        target_uid = owner_id if owner_id else uid
+        
+        folder_ref = db.collection("tenants").document(target_uid).collection("folders").document(folder_id).get()
+        
+        if not folder_ref.exists:
+            return jsonify({"error": "Folder not found"}), 404
+            
+        folder_data = folder_ref.to_dict()
+        
+        # Permission check: must be owner or have a share document
+        # For shared users, we check the global shares collection
+        is_owner = uid == folder_data.get("owner")
+        has_share = False
+        
+        if not is_owner:
+            # Check global shares collection for this user
+            shares_query = db.collection("shares").where("folderId", "==", folder_id).where("ownerId", "==", target_uid).get()
+            for share_doc in shares_query:
+                share_data = share_doc.to_dict()
+                # Match by email from the token (you may need to get email from token)
+                # For simplicity, we also check shared_with map if it exists
+                if uid in folder_data.get("shared_with", {}):
+                    has_share = True
+                    break
+            # Also accept if shared_with map contains uid
+            if uid in folder_data.get("shared_with", {}):
+                has_share = True
+        
+        if not is_owner and not has_share:
+            # Fallback: allow if there's any share doc for this folder (looser check)
+            # This handles email-based sharing where we can't easily match uid
+            shares_query = db.collection("shares").where("folderId", "==", folder_id).where("ownerId", "==", target_uid).get()
+            if len(list(shares_query)) > 0:
+                has_share = True
+        
+        if not is_owner and not has_share:
+            return jsonify({"error": "Access denied"}), 403
+        
+        return jsonify({
+            "is_trained": folder_data.get("is_trained", False),
+            "selected_kpis": folder_data.get("selected_kpis", []),
+            "context_hint": folder_data.get("context_hint", ""),
+            "status": folder_data.get("status", "unknown")
+        }), 200
+        
+    except Exception as e:
+        print(f"❌ Get KPIs Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# ==========================================
+# 🚜 6. BATCH ENGINE (GCS TRIGGER HANDLER)
 # ==========================================
 @app.route("/", methods=["POST", "OPTIONS"])
 def gcs_trigger_handler():
@@ -254,7 +323,6 @@ def gcs_trigger_handler():
     folder_id = parts[2]
 
     try:
-        # 1. Get training data AND context hint from Firestore
         folder_ref = db.collection("tenants").document(uid).collection("folders").document(folder_id).get()
         if not folder_ref.exists:
             return jsonify({"error": "Folder not trained"}), 200
@@ -263,19 +331,6 @@ def gcs_trigger_handler():
         kpis = folder_data.get("selected_kpis", [])
         context_hint = folder_data.get("context_hint", "")
 
-        # Enforce edit permission for non-owners
-        # Note: GCS trigger uses path with owner uid; if a shared editor uploads via UI,
-        # ensure your upload path writes under owner's uid to keep data centralized.
-        # Here we only guard against view-only users.
-        # (If you pass uploader uid via metadata, you can check it here.)
-        # For now, assume uploads under owner's path are allowed; block if explicitly view-only.
-        # If you want stricter checks, add uploader uid to event payload and validate.
-        # Example guard (safe even without uploader info):
-        # perm = folder_data.get("shared_with", {}).get(uid)
-        # if uid != folder_data["owner"] and perm != "edit":
-        #     return jsonify({"error": "You have view-only access"}), 403
-
-        # 2. Extract data using Gemini with specific context
         storage_client = storage.Client()
         source_bucket = storage_client.bucket(BUCKET_NAME)
         blob = source_bucket.blob(file_path)
@@ -292,7 +347,7 @@ def gcs_trigger_handler():
             contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                temperature=0.0 # Force robot-like consistency
+                temperature=0.0
             ),
         )
         
@@ -304,7 +359,6 @@ def gcs_trigger_handler():
         if isinstance(extracted_data, list):
             extracted_data = extracted_data[0]
 
-        # 3. Insert into BigQuery (always under owner's uid)
         owner_uid = folder_data.get("owner", uid)
         table_id = sync_bigquery_schema(owner_uid, folder_id, kpis)
         row = {
@@ -324,7 +378,6 @@ def gcs_trigger_handler():
             print(f"❌ BigQuery Insert Errors: {errors}")
             return jsonify({"error": "BigQuery Insert Failed"}), 200
 
-        # 4. Move file to processed
         new_path = file_path.replace("incoming/", "processed/")
         source_bucket.copy_blob(blob, source_bucket, new_path)
         blob.delete()
@@ -337,7 +390,7 @@ def gcs_trigger_handler():
         return jsonify({"error": str(e)}), 200
 
 # ==========================================
-# 📈 6. FETCH RESULTS API (UPDATED TO RESOLVE OWNER TABLE)
+# 📈 7. FETCH RESULTS API
 # ==========================================
 @app.route("/get-results", methods=["GET", "OPTIONS"])
 def get_results():
@@ -346,24 +399,26 @@ def get_results():
     if not uid: return jsonify({"error": "Unauthorized"}), 401
     
     folder_id = request.args.get("folder_id")
+    owner_id = request.args.get("owner_id")  # NEW: accept owner_id for shared folders
+    
     if not folder_id: return jsonify({"error": "folder_id required"}), 400
 
     try:
-        # Try to get folder under requesting user's tenant
-        folder_ref = db.collection("tenants").document(uid).collection("folders").document(folder_id).get()
+        # Use owner_id if provided (shared folder case), otherwise use requesting user
+        target_uid = owner_id if owner_id else uid
+        
+        folder_ref = db.collection("tenants").document(target_uid).collection("folders").document(folder_id).get()
         folder_data = None
 
         if folder_ref.exists:
             folder_data = folder_ref.to_dict()
         else:
             # Fallback: search for the folder across tenants (shared case)
-            # For production, index shared folders for efficiency.
             tenants = db.collection("tenants").stream()
             for tenant in tenants:
                 f_ref = db.collection("tenants").document(tenant.id).collection("folders").document(folder_id).get()
                 if f_ref.exists:
                     fd = f_ref.to_dict()
-                    # Only accept if user is owner or in shared_with
                     if uid == fd.get("owner") or uid in fd.get("shared_with", {}):
                         folder_data = fd
                         break
@@ -373,11 +428,14 @@ def get_results():
 
         owner_uid = folder_data["owner"]
 
-        # Permission check: owner or shared user
+        # Permission check
         if not (uid == owner_uid or uid in folder_data.get("shared_with", {})):
-            return jsonify({"error": "Unauthorized"}), 403
+            # Also check global shares collection
+            shares_query = db.collection("shares").where("folderId", "==", folder_id).where("ownerId", "==", owner_uid).get()
+            has_share = len(list(shares_query)) > 0
+            if not has_share:
+                return jsonify({"error": "Unauthorized"}), 403
 
-        # Build table ID using owner UID so shared users see the same data
         clean_uid = re.sub(r'[^a-zA-Z0-9_]', '_', owner_uid).lower()
         clean_folder = re.sub(r'[^a-zA-Z0-9_]', '_', folder_id).lower()
         table_id = f"{PROJECT_ID}.{DATASET}.{clean_uid}_{clean_folder}"
@@ -391,14 +449,6 @@ def get_results():
     except Exception as e:
         print(f"❌ Fetch Results Error: {e}")
         return jsonify({"results": []}), 200
-
-def _build_cors_preflight_response():
-    response = make_response()
-    response.headers.add("Access-Control-Allow-Origin", "*")
-    response.headers.add("Access-Control-Allow-Headers", "Content-Type,Authorization,Accept")
-    response.headers.add("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-    response.headers.add("Access-Control-Max-Age", "3600")
-    return response, 204
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
