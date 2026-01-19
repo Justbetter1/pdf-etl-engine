@@ -53,6 +53,19 @@ def get_user_id(req):
         print(f"❌ Auth Error: {e}")
         return None
 
+def get_user_email(req):
+    """Get user email from Firebase token."""
+    auth_header = req.headers.get("Authorization")
+    if not auth_header:
+        return None
+    try:
+        token = auth_header.split("Bearer ")[1]
+        decoded_token = auth.verify_id_token(token)
+        return decoded_token.get("email", "").lower()
+    except Exception as e:
+        print(f"❌ Auth Error: {e}")
+        return None
+
 def _build_cors_preflight_response():
     response = make_response()
     response.headers.add("Access-Control-Allow-Origin", "*")
@@ -302,7 +315,74 @@ def get_kpis():
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 🚜 6. BATCH ENGINE (GCS TRIGGER HANDLER)
+# 📤 6. UPLOAD BATCH FILE (for shared users)
+# ==========================================
+@app.route("/upload-batch-file", methods=["POST", "OPTIONS"])
+def upload_batch_file():
+    if request.method == "OPTIONS": return _build_cors_preflight_response()
+    
+    uid = get_user_id(request)
+    user_email = get_user_email(request)
+    
+    if not uid or not user_email:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    try:
+        # Get form data
+        folder_id = request.form.get("folder_id")
+        owner_id = request.form.get("owner_id")
+        file = request.files.get("file")
+
+        if not folder_id or not owner_id or not file:
+            return jsonify({"error": "Missing required fields: folder_id, owner_id, or file"}), 400
+
+        # Validate file is PDF
+        if not file.filename.lower().endswith('.pdf'):
+            return jsonify({"error": "Only PDF files are allowed"}), 400
+
+        # Sanitize email for document ID lookup
+        sanitized_email = re.sub(r'[@.]', '_', user_email)
+        share_doc_id = f"{owner_id}_{folder_id}_{sanitized_email}"
+
+        # Verify share permission in Firestore
+        share_ref = db.collection("shares").document(share_doc_id).get()
+
+        if not share_ref.exists:
+            return jsonify({"error": "Share not found. You do not have access to this folder."}), 403
+
+        share_data = share_ref.to_dict()
+        permission = share_data.get("permission", "view")
+
+        if permission != "edit":
+            return jsonify({"error": "You have view-only access. Upload not permitted."}), 403
+
+        # Sanitize filename
+        original_filename = file.filename or "unnamed.pdf"
+        sanitized_filename = re.sub(r'[^a-zA-Z0-9_.-]', '_', original_filename)
+
+        # Upload to Firebase Storage with admin privileges
+        storage_path = f"incoming/{owner_id}/{folder_id}/batch/{sanitized_filename}"
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(BUCKET_NAME)
+        blob = bucket.blob(storage_path)
+        
+        # Upload file content
+        blob.upload_from_file(file, content_type="application/pdf")
+
+        print(f"✅ Shared user {user_email} uploaded {sanitized_filename} to {storage_path}")
+
+        return jsonify({
+            "success": True,
+            "path": storage_path,
+            "filename": sanitized_filename
+        }), 200
+
+    except Exception as e:
+        print(f"❌ Upload Batch File Error: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+# ==========================================
+# 🚜 7. BATCH ENGINE (GCS TRIGGER HANDLER)
 # ==========================================
 @app.route("/", methods=["POST", "OPTIONS"])
 def gcs_trigger_handler():
@@ -390,7 +470,7 @@ def gcs_trigger_handler():
         return jsonify({"error": str(e)}), 200
 
 # ==========================================
-# 📈 7. FETCH RESULTS API
+# 📈 8. FETCH RESULTS API
 # ==========================================
 @app.route("/get-results", methods=["GET", "OPTIONS"])
 def get_results():
