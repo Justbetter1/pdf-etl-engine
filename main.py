@@ -75,45 +75,122 @@ def _build_cors_preflight_response():
     return response, 204
 
 # ==========================================
-# 🔍 KPI TYPE INFERENCE HELPER
+# 🧠 AI-POWERED KPI TYPE INFERENCE
 # ==========================================
-def infer_kpi_type(value):
-    """Infer the data type of a KPI based on its sample value."""
-    if value is None or value == "" or value == "N/A":
+def infer_kpi_types_with_ai(kpi_samples: dict) -> dict:
+    """
+    Use Gemini AI to intelligently analyze KPI names and sample values
+    to determine their data types.
+    
+    Returns: dict mapping kpi_name -> type ("number", "date", "categorical", "string")
+    """
+    if not kpi_samples:
+        return {}
+    
+    # Build the prompt with all KPIs
+    kpi_list = []
+    for kpi_name, sample_value in kpi_samples.items():
+        kpi_list.append(f'- "{kpi_name}": "{sample_value}"')
+    
+    kpi_text = "\n".join(kpi_list)
+    
+    prompt = f"""
+Analyze these KPI field names and their sample values. For each KPI, determine the most appropriate data type.
+
+KPIs to analyze:
+{kpi_text}
+
+Rules for type assignment:
+1. "number" - For monetary values, quantities, percentages, measurements, counts, IDs that are purely numeric
+2. "date" - For dates, timestamps, periods, years, months (e.g., "2024-01-15", "January 2024", "Q1 2024")
+3. "categorical" - For status values, categories, types, codes, identifiers with limited possible values (e.g., "Active", "KDC-54", "Type A", "Approved")
+4. "string" - For free-form text, descriptions, names, addresses, comments, long text fields
+
+Important:
+- Alphanumeric codes like "KDC-54", "INV-001", "ABC123" are "categorical" NOT "date"
+- Pure numeric IDs or reference numbers are "number"
+- Short identifiers and codes are "categorical"
+- Rig IDs, equipment codes, reference codes are "categorical"
+
+Return ONLY a valid JSON object with this exact format:
+{{"kpi_name": "type", "another_kpi": "type"}}
+
+Do not include any explanation, just the JSON.
+"""
+
+    try:
+        resp = client.models.generate_content(
+            model="gemini-2.0-flash-001",
+            contents=[prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.0
+            ),
+        )
+        
+        raw_text = resp.text.strip()
+        if raw_text.startswith("```"):
+            raw_text = re.sub(r'^```json\s*|```$', '', raw_text, flags=re.MULTILINE)
+        
+        type_mapping = json.loads(raw_text)
+        
+        # Validate types - ensure only allowed values
+        valid_types = {"number", "date", "categorical", "string"}
+        validated_mapping = {}
+        for kpi_name, kpi_type in type_mapping.items():
+            if kpi_type.lower() in valid_types:
+                validated_mapping[kpi_name] = kpi_type.lower()
+            else:
+                validated_mapping[kpi_name] = "string"
+        
+        print(f"✅ AI Type Inference Result: {validated_mapping}")
+        return validated_mapping
+        
+    except Exception as e:
+        print(f"❌ AI Type Inference Error: {e}")
+        # Fallback to basic inference
+        return {kpi: "string" for kpi in kpi_samples.keys()}
+
+
+def infer_kpi_type_fallback(value):
+    """Fallback regex-based type inference if AI fails."""
+    if value is None or value == "" or value == "N/A" or value == "---":
         return "string"
     
     val_str = str(value).strip()
     
-    # Check for number (integer or float)
-    try:
-        float(val_str.replace(",", "").replace("$", "").replace("%", ""))
+    # Check for number
+    numeric_cleaned = re.sub(r'[$€£¥,\s%]', '', val_str)
+    if re.match(r'^-?\d+\.?\d*$', numeric_cleaned):
         return "number"
-    except ValueError:
-        pass
     
-    # Check for date patterns
+    # Check for alphanumeric codes (letters + numbers = categorical)
+    has_letters = bool(re.search(r'[A-Za-z]', val_str))
+    has_numbers = bool(re.search(r'\d', val_str))
+    
+    if has_letters and has_numbers:
+        # Check for month names in dates
+        month_pattern = r'^(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}$'
+        if re.match(month_pattern, val_str, re.IGNORECASE):
+            return "date"
+        return "categorical" if len(val_str) <= 30 else "string"
+    
+    # Pure date patterns
     date_patterns = [
-        r'^\d{4}-\d{2}-\d{2}$',           # 2024-01-15
-        r'^\d{2}/\d{2}/\d{4}$',           # 01/15/2024
-        r'^\d{2}-\d{2}-\d{4}$',           # 15-01-2024
-        r'^\d{1,2}\s+\w+\s+\d{4}$',       # 15 January 2024
-        r'^\w+\s+\d{1,2},?\s+\d{4}$',     # January 15, 2024
+        r'^\d{4}[-/]\d{1,2}[-/]\d{1,2}$',
+        r'^\d{1,2}[-/]\d{1,2}[-/]\d{4}$',
+        r'^\d{1,2}[-/]\d{1,2}[-/]\d{2}$',
     ]
     for pattern in date_patterns:
-        if re.match(pattern, val_str, re.IGNORECASE):
+        if re.match(pattern, val_str):
             return "date"
     
-    # Check for categorical (short string with limited unique values pattern)
-    # Heuristic: if it's a short uppercase/titlecase word or known status
-    categorical_indicators = [
-        "active", "inactive", "pending", "approved", "rejected", "completed",
-        "yes", "no", "true", "false", "open", "closed", "paid", "unpaid",
-        "high", "medium", "low", "male", "female", "new", "used"
-    ]
-    if val_str.lower() in categorical_indicators or (len(val_str) < 20 and val_str.replace(" ", "").isalpha()):
+    # Categorical indicators
+    if len(val_str) <= 25 and val_str.replace(" ", "").replace("-", "").isalpha():
         return "categorical"
     
     return "string"
+
 
 # ==========================================
 # 📊 BIGQUERY SCHEMA SYNC & TABLE CREATION
@@ -265,7 +342,7 @@ def analyze_master():
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# ✅ 4. CONFIRM SELECTED KPIs
+# ✅ 4. CONFIRM SELECTED KPIs (WITH AI TYPE INFERENCE)
 # ==========================================
 @app.route("/confirm-kpis", methods=["POST", "OPTIONS"])
 def confirm_kpis():
@@ -277,24 +354,42 @@ def confirm_kpis():
         payload = request.get_json()
         folder_id = payload.get("folder_id")
         selected_kpis = payload.get("selected_kpis")
-        kpi_samples = payload.get("kpi_samples", {})  # NEW: receive samples from frontend
+        kpi_samples = payload.get("kpi_samples", {})
 
+        # 🧠 Use AI to infer types for all KPIs at once
+        print(f"🧠 Calling Gemini AI to analyze {len(kpi_samples)} KPIs...")
+        kpi_types = infer_kpi_types_with_ai(kpi_samples)
+        
+        # Build the full KPI metadata with types
+        kpi_metadata = []
+        for kpi_name in selected_kpis:
+            sample_value = kpi_samples.get(kpi_name, "")
+            inferred_type = kpi_types.get(kpi_name, infer_kpi_type_fallback(sample_value))
+            kpi_metadata.append({
+                "name": kpi_name,
+                "sample_value": sample_value,
+                "type": inferred_type
+            })
+
+        # Store everything in Firestore
         db.collection("tenants").document(uid).collection("folders").document(folder_id).update({
             "selected_kpis": selected_kpis,
-            "kpi_samples": kpi_samples,  # NEW: store samples for type inference
+            "kpi_samples": kpi_samples,
+            "kpi_metadata": kpi_metadata,  # NEW: Store full metadata with AI-inferred types
             "is_trained": True,
             "status": "active"
         })
         
         sync_bigquery_schema(uid, folder_id, selected_kpis)
         
-        return jsonify({"status": "success"}), 200
+        print(f"✅ KPIs confirmed with AI-inferred types: {kpi_metadata}")
+        return jsonify({"status": "success", "kpi_metadata": kpi_metadata}), 200
     except Exception as e:
         print(f"❌ Confirm KPIs Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 📋 5. GET KPIs (with type metadata)
+# 📋 5. GET KPIs (with pre-computed type metadata)
 # ==========================================
 @app.route("/get-kpis", methods=["GET", "OPTIONS"])
 def get_kpis():
@@ -317,19 +412,9 @@ def get_kpis():
             
         folder_data = folder_ref.to_dict()
         
-        # Permission check: must be owner or have a share document
+        # Permission check
         is_owner = uid == folder_data.get("owner")
-        has_share = False
-        
-        if not is_owner:
-            shares_query = db.collection("shares").where("folderId", "==", folder_id).where("ownerId", "==", target_uid).get()
-            for share_doc in shares_query:
-                share_data = share_doc.to_dict()
-                if uid in folder_data.get("shared_with", {}):
-                    has_share = True
-                    break
-            if uid in folder_data.get("shared_with", {}):
-                has_share = True
+        has_share = uid in folder_data.get("shared_with", {})
         
         if not is_owner and not has_share:
             shares_query = db.collection("shares").where("folderId", "==", folder_id).where("ownerId", "==", target_uid).get()
@@ -339,14 +424,32 @@ def get_kpis():
         if not is_owner and not has_share:
             return jsonify({"error": "Access denied"}), 403
         
-        # Build KPI metadata with types
+        # Return pre-computed metadata if available (from AI inference)
+        kpi_metadata = folder_data.get("kpi_metadata")
+        
+        if kpi_metadata:
+            # Use pre-computed AI-inferred types
+            return jsonify({
+                "is_trained": folder_data.get("is_trained", False),
+                "selected_kpis": kpi_metadata,
+                "context_hint": folder_data.get("context_hint", ""),
+                "status": folder_data.get("status", "unknown")
+            }), 200
+        
+        # Fallback: compute types on-the-fly for older folders
         selected_kpis_raw = folder_data.get("selected_kpis", [])
         kpi_samples = folder_data.get("kpi_samples", {})
+        
+        # Try AI inference if samples exist
+        if kpi_samples:
+            kpi_types = infer_kpi_types_with_ai(kpi_samples)
+        else:
+            kpi_types = {}
         
         selected_kpis_with_types = []
         for kpi_name in selected_kpis_raw:
             sample_value = kpi_samples.get(kpi_name, "")
-            kpi_type = infer_kpi_type(sample_value)
+            kpi_type = kpi_types.get(kpi_name, infer_kpi_type_fallback(sample_value))
             selected_kpis_with_types.append({
                 "name": kpi_name,
                 "sample_value": sample_value,
@@ -355,7 +458,7 @@ def get_kpis():
         
         return jsonify({
             "is_trained": folder_data.get("is_trained", False),
-            "selected_kpis": selected_kpis_with_types,  # Now includes type metadata
+            "selected_kpis": selected_kpis_with_types,
             "context_hint": folder_data.get("context_hint", ""),
             "status": folder_data.get("status", "unknown")
         }), 200
