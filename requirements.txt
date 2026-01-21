@@ -6,3 +6,4 @@ google-cloud-bigquery
 google-cloud-firestore
 google-genai==1.1.0
 firebase-admin
+python-dateutil
