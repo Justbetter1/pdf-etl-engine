@@ -113,10 +113,17 @@ Important:
 - Short identifiers and codes are "categorical"
 - Rig IDs, equipment codes, reference codes are "categorical"
 
-Return ONLY a valid JSON object with this exact format:
-{{"kpi_name": "type", "another_kpi": "type"}}
+Additional Context:
+- You will be analyzing data extracted from PDFs. Identify fields that make sense to appear as KPIs for a dashboard.
+- If the input contains a table, recognize it as structured data with rows and columns. Each column header represents a KPI field name, and each cell under it is a sample value.
+- Treat column headers as KPI names and analyze their sample values accordingly.
+- The ultimate goal is to classify these KPIs correctly so they can be displayed as a **dashboard** with charts, metrics, and filters.
+- These classifications will be used to design a KPI dashboard, so accuracy in type assignment is critical.
 
+Return ONLY a valid JSON object with this exact format:
+{"kpi_name": "type", "another_kpi": "type"}
 Do not include any explanation, just the JSON.
+
 """
 
     try:
@@ -808,3 +815,4 @@ def get_results():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
