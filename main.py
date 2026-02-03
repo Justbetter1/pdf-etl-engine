@@ -96,34 +96,45 @@ def infer_kpi_types_with_ai(kpi_samples: dict) -> dict:
     kpi_text = "\n".join(kpi_list)
     
     prompt = f"""
-Analyze these KPI field names and their sample values. For each KPI, determine the most appropriate data type.
+You are analyzing business data extracted from PDFs. Your task is to identify KPI fields and classify them into the correct data types so they can be stored in a database and visualized in a dashboard.
 
-KPIs to analyze:
+Input:
 {kpi_text}
 
-Rules for type assignment:
-1. "number" - For monetary values, quantities, percentages, measurements, counts, IDs that are purely numeric
-2. "date" - For dates, timestamps, periods, years, months (e.g., "2024-01-15", "January 2024", "Q1 2024")
-3. "categorical" - For status values, categories, types, codes, identifiers with limited possible values (e.g., "Active", "KDC-54", "Type A", "Approved")
-4. "string" - For free-form text, descriptions, names, addresses, comments, long text fields
+Interpretation Rules:
+1. If the input is a table:
+   • Treat each column header as a KPI field name.
+   • Treat the values under each column as sample values for that KPI.
+   • Analyze column by column, not row by row.
+   • Output each column header as a KPI with its assigned type.
 
-Important:
-- Alphanumeric codes like "KDC-54", "INV-001", "ABC123" are "categorical" NOT "date"
-- Pure numeric IDs or reference numbers are "number"
-- Short identifiers and codes are "categorical"
-- Rig IDs, equipment codes, reference codes are "categorical"
+2. If the input is not a table:
+   • Read the text carefully and decide whether each item is a KPI field name or just a sample value.
+   • If it looks like a KPI field name (e.g., "Revenue", "Start Date", "Status"), classify it.
+   • If it looks like only a sample value without a clear KPI field name, ignore it.
 
-Additional Context:
-- You will be analyzing data extracted from PDFs. Identify fields that make sense to appear as KPIs for a dashboard.
-- If the input contains a table, recognize it as structured data with rows and columns. Each column header represents a KPI field name, and each cell under it is a sample value.
-- Treat column headers as KPI names and analyze their sample values accordingly.
-- The ultimate goal is to classify these KPIs correctly so they can be displayed as a **dashboard** with charts, metrics, and filters.
-- These classifications will be used to design a KPI dashboard, so accuracy in type assignment is critical.
+Data Type Assignment:
+- "number" → monetary values, quantities, percentages, measurements, counts, IDs that are purely numeric
+- "date" → dates, timestamps, periods, years, months (e.g., "2024-01-15", "January 2024", "Q1 2024")
+- "categorical" → status values, categories, types, codes, identifiers with limited possible values (e.g., "Active", "KDC-54", "Type A", "Approved")
+- "string" → free-form text, descriptions, names, addresses, comments, long text fields
 
-Return ONLY a valid JSON object with this exact format:
+Important Clarifications:
+- Alphanumeric codes like "KDC-54", "INV-001", "ABC123" → "categorical"
+- Pure numeric IDs or reference numbers → "number"
+- Short identifiers and codes → "categorical"
+- Rig IDs, equipment codes, reference codes → "categorical"
+
+Goal:
+- Identify KPIs that make sense to appear in a dashboard.
+- Classify each KPI correctly so it can be stored in a structured database and later visualized with charts, metrics, and filters.
+- Accuracy in type assignment is critical because this output drives dashboard design.
+
+Output:
+Return ONLY a valid JSON object in this exact format:
 {"kpi_name": "type", "another_kpi": "type"}
-Do not include any explanation, just the JSON.
 
+Do not include any explanation, just the JSON.
 """
 
     try:
@@ -815,4 +826,5 @@ def get_results():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
