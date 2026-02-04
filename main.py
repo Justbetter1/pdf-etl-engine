@@ -103,36 +103,36 @@ Input:
 
 Interpretation Rules:
 1. If the input is a table:
-   • Treat each column header as a KPI field name.
-   • Treat the values under each column as sample values for that KPI.
-   • Analyze column by column, not row by row.
-   • Output each column header as a KPI with its assigned type.
+   • Only the column headers represent KPI field names.  
+   • The values in the rows are sample data for those KPI fields.  
+   • Do not treat each individual cell as a separate KPI.  
+   • Analyze column by column: assign one data type per column header based on its sample values.  
 
 2. If the input is not a table:
-   • Read the text carefully and decide whether each item is a KPI field name or just a sample value.
-   • If it looks like a KPI field name (e.g., "Revenue", "Start Date", "Status"), classify it.
-   • If it looks like only a sample value without a clear KPI field name, ignore it.
+   • Read the text carefully and decide whether each item is a KPI field name or just a sample value.  
+   • If it looks like a KPI field name (e.g., "Revenue", "Start Date", "Status"), classify it.  
+   • If it looks like only a sample value without a clear KPI field name (e.g., "Active", "12345", "2024-01-15"), ignore it.  
 
 Data Type Assignment:
-- "number" → monetary values, quantities, percentages, measurements, counts, IDs that are purely numeric
-- "date" → dates, timestamps, periods, years, months (e.g., "2024-01-15", "January 2024", "Q1 2024")
-- "categorical" → status values, categories, types, codes, identifiers with limited possible values (e.g., "Active", "KDC-54", "Type A", "Approved")
-- "string" → free-form text, descriptions, names, addresses, comments, long text fields
+- "number" → monetary values, quantities, percentages, measurements, counts, IDs that are purely numeric  
+- "date" → dates, timestamps, periods, years, months (e.g., "2024-01-15", "January 2024", "Q1 2024")  
+- "categorical" → status values, categories, types, codes, identifiers with limited possible values (e.g., "Active", "KDC-54", "Type A", "Approved")  
+- "string" → free-form text, descriptions, names, addresses, comments, long text fields  
 
 Important Clarifications:
-- Alphanumeric codes like "KDC-54", "INV-001", "ABC123" → "categorical"
-- Pure numeric IDs or reference numbers → "number"
-- Short identifiers and codes → "categorical"
-- Rig IDs, equipment codes, reference codes → "categorical"
+- Alphanumeric codes like "KDC-54", "INV-001", "ABC123" → "categorical"  
+- Pure numeric IDs or reference numbers → "number"  
+- Short identifiers and codes → "categorical"  
+- Rig IDs, equipment codes, reference codes → "categorical"  
 
 Goal:
-- Identify KPIs that make sense to appear in a dashboard.
-- Classify each KPI correctly so it can be stored in a structured database and later visualized with charts, metrics, and filters.
-- Accuracy in type assignment is critical because this output drives dashboard design.
+- Identify KPIs that make sense to appear in a dashboard.  
+- Classify each KPI correctly so it can be stored in a structured database and later visualized with charts, metrics, and filters.  
+- Accuracy in type assignment is critical because this output drives dashboard design.  
 
 Output:
-Return ONLY a valid JSON object in this exact format:
-{"kpi_name": "type", "another_kpi": "type"}
+Return ONLY a valid JSON object in this exact format:  
+{"kpi_name": "type", "another_kpi": "type"}  
 
 Do not include any explanation, just the JSON.
 """
@@ -826,5 +826,6 @@ def get_results():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
