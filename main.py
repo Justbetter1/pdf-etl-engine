@@ -27,7 +27,7 @@ CORS(app, resources={r"/*": {
 PROJECT_ID = "pdf-etl-479411"
 DATASET = "etl_reports"
 LOCATION = "us-central1"
-BUCKET_NAME = "pdf_platform_main" 
+BUCKET_NAME = "pdf_platform_main"
 
 # 4. Initialize Google Services
 try:
@@ -82,57 +82,39 @@ def infer_kpi_types_with_ai(kpi_samples: dict) -> dict:
     """
     Use Gemini AI to intelligently analyze KPI names and sample values
     to determine their data types.
-    
+
     Returns: dict mapping kpi_name -> type ("number", "date", "categorical", "string")
     """
     if not kpi_samples:
         return {}
-    
+
     # Build the prompt with all KPIs
     kpi_list = []
     for kpi_name, sample_value in kpi_samples.items():
         kpi_list.append(f'- "{kpi_name}": "{sample_value}"')
-    
-    kpi_text = "\n".join(kpi_list)
-    
-    prompt = f"""
-You are analyzing business data extracted from PDFs. Your task is to identify KPI fields and classify them into the correct data types so they can be stored in a database and visualized in a dashboard.
 
-Input:
+    kpi_text = "\n".join(kpi_list)
+
+    prompt = f"""
+Analyze these KPI field names and their sample values. For each KPI, determine the most appropriate data type.
+
+KPIs to analyze:
 {kpi_text}
 
-Interpretation Rules:
-1. If the input is a table:
-   • Only the column headers represent KPI field names.  
-   • The values in the rows are sample data for those KPI fields.  
-   • Do not treat each individual cell as a separate KPI.  
-   • Analyze column by column: assign one data type per column header based on its sample values.  
+Rules for type assignment:
+1. "number" - For monetary values, quantities, percentages, measurements, counts, IDs that are purely numeric
+2. "date" - For dates, timestamps, periods, years, months (e.g., "2024-01-15", "January 2024", "Q1 2024")
+3. "categorical" - For status values, categories, types, codes, identifiers with limited possible values (e.g., "Active", "KDC-54", "Type A", "Approved")
+4. "string" - For free-form text, descriptions, names, addresses, comments, long text fields
 
-2. If the input is not a table:
-   • Read the text carefully and decide whether each item is a KPI field name or just a sample value.  
-   • If it looks like a KPI field name (e.g., "Revenue", "Start Date", "Status"), classify it.  
-   • If it looks like only a sample value without a clear KPI field name (e.g., "Active", "12345", "2024-01-15"), ignore it.  
+Important:
+- Alphanumeric codes like "KDC-54", "INV-001", "ABC123" are "categorical" NOT "date"
+- Pure numeric IDs or reference numbers are "number"
+- Short identifiers and codes are "categorical"
+- Rig IDs, equipment codes, reference codes are "categorical"
 
-Data Type Assignment:
-- "number" → monetary values, quantities, percentages, measurements, counts, IDs that are purely numeric  
-- "date" → dates, timestamps, periods, years, months (e.g., "2024-01-15", "January 2024", "Q1 2024")  
-- "categorical" → status values, categories, types, codes, identifiers with limited possible values (e.g., "Active", "KDC-54", "Type A", "Approved")  
-- "string" → free-form text, descriptions, names, addresses, comments, long text fields  
-
-Important Clarifications:
-- Alphanumeric codes like "KDC-54", "INV-001", "ABC123" → "categorical"  
-- Pure numeric IDs or reference numbers → "number"  
-- Short identifiers and codes → "categorical"  
-- Rig IDs, equipment codes, reference codes → "categorical"  
-
-Goal:
-- Identify KPIs that make sense to appear in a dashboard.  
-- Classify each KPI correctly so it can be stored in a structured database and later visualized with charts, metrics, and filters.  
-- Accuracy in type assignment is critical because this output drives dashboard design.  
-
-Output:
-Return ONLY a valid JSON object in this exact format:  
-{"kpi_name": "type", "another_kpi": "type"}  
+Return ONLY a valid JSON object with this exact format:
+{{"kpi_name": "type", "another_kpi": "type"}}
 
 Do not include any explanation, just the JSON.
 """
@@ -146,25 +128,25 @@ Do not include any explanation, just the JSON.
                 temperature=0.0
             ),
         )
-        
+
         raw_text = resp.text.strip()
         if raw_text.startswith("```"):
             raw_text = re.sub(r'^```json\s*|```$', '', raw_text, flags=re.MULTILINE)
-        
+
         type_mapping = json.loads(raw_text)
-        
+
         # Validate types - ensure only allowed values
         valid_types = {"number", "date", "categorical", "string"}
         validated_mapping = {}
         for kpi_name, kpi_type in type_mapping.items():
-            if kpi_type.lower() in valid_types:
+            if isinstance(kpi_type, str) and kpi_type.lower() in valid_types:
                 validated_mapping[kpi_name] = kpi_type.lower()
             else:
                 validated_mapping[kpi_name] = "string"
-        
+
         print(f"✅ AI Type Inference Result: {validated_mapping}")
         return validated_mapping
-        
+
     except Exception as e:
         print(f"❌ AI Type Inference Error: {e}")
         # Fallback to basic inference
@@ -175,25 +157,25 @@ def infer_kpi_type_fallback(value):
     """Fallback regex-based type inference if AI fails."""
     if value is None or value == "" or value == "N/A" or value == "---":
         return "string"
-    
+
     val_str = str(value).strip()
-    
+
     # Check for number
     numeric_cleaned = re.sub(r'[$€£¥,\s%]', '', val_str)
     if re.match(r'^-?\d+\.?\d*$', numeric_cleaned):
         return "number"
-    
+
     # Check for alphanumeric codes (letters + numbers = categorical)
     has_letters = bool(re.search(r'[A-Za-z]', val_str))
     has_numbers = bool(re.search(r'\d', val_str))
-    
+
     if has_letters and has_numbers:
         # Check for month names in dates
         month_pattern = r'^(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}$'
         if re.match(month_pattern, val_str, re.IGNORECASE):
             return "date"
         return "categorical" if len(val_str) <= 30 else "string"
-    
+
     # Pure date patterns
     date_patterns = [
         r'^\d{4}[-/]\d{1,2}[-/]\d{1,2}$',
@@ -203,11 +185,11 @@ def infer_kpi_type_fallback(value):
     for pattern in date_patterns:
         if re.match(pattern, val_str):
             return "date"
-    
+
     # Categorical indicators
     if len(val_str) <= 25 and val_str.replace(" ", "").replace("-", "").isalpha():
         return "categorical"
-    
+
     return "string"
 
 
@@ -232,9 +214,9 @@ def convert_value_for_bq(value, ai_type: str):
     """
     if value is None or value == "" or value == "N/A" or value == "---":
         return None
-    
+
     val_str = str(value).strip()
-    
+
     if ai_type == "number":
         try:
             # Remove currency symbols, commas, spaces, percentage signs
@@ -246,7 +228,7 @@ def convert_value_for_bq(value, ai_type: str):
         except (ValueError, TypeError):
             print(f"⚠️ Could not convert '{value}' to number, returning None")
             return None
-    
+
     elif ai_type == "date":
         try:
             parsed_date = date_parser.parse(val_str, fuzzy=True)
@@ -254,7 +236,7 @@ def convert_value_for_bq(value, ai_type: str):
         except (ValueError, TypeError):
             print(f"⚠️ Could not parse '{value}' as date, returning None")
             return None
-    
+
     else:  # categorical or string
         return val_str
 
@@ -271,44 +253,44 @@ def sync_bigquery_schema_typed(uid, folder_id, kpi_metadata):
     clean_uid = re.sub(r'[^a-zA-Z0-9_]', '_', uid).lower()
     clean_folder = re.sub(r'[^a-zA-Z0-9_]', '_', folder_id).lower()
     table_id = f"{PROJECT_ID}.{DATASET}.{clean_uid}_{clean_folder}"
-    
+
     # Build type lookup from kpi_metadata
     kpi_type_lookup = {}
     for kpi in kpi_metadata:
         kpi_name = kpi.get("name", "")
         kpi_type = kpi.get("type", "string")
         kpi_type_lookup[kpi_name] = kpi_type
-    
+
     try:
         table = bq_client.get_table(table_id)
         existing_cols = {field.name for field in table.schema}
-        
+
         new_fields = []
         for kpi in kpi_metadata:
             kpi_name = kpi.get("name", "")
             kpi_type = kpi.get("type", "string")
             col_name = f"kpi_{re.sub(r'[^a-zA-Z0-9_]', '_', kpi_name).lower()}"
-            
+
             if col_name not in existing_cols:
                 bq_type = get_bigquery_type(kpi_type)
                 new_fields.append(bigquery.SchemaField(col_name, bq_type))
                 print(f"📊 Adding column: {col_name} as {bq_type}")
-        
+
         if new_fields:
             table.schema += new_fields
             bq_client.update_table(table, ["schema"])
             print(f"✅ Table {table_id} updated with {len(new_fields)} new typed columns.")
-        
-    except Exception as e:
+
+    except Exception:
         # Table doesn't exist - create with full typed schema
         print(f"📊 Creating new table with typed schema: {table_id}")
-        
+
         schema = [
             bigquery.SchemaField("row_id", "STRING"),
             bigquery.SchemaField("file_name", "STRING"),
             bigquery.SchemaField("uploaded_at", "TIMESTAMP"),
         ]
-        
+
         for kpi in kpi_metadata:
             kpi_name = kpi.get("name", "")
             kpi_type = kpi.get("type", "string")
@@ -316,12 +298,12 @@ def sync_bigquery_schema_typed(uid, folder_id, kpi_metadata):
             bq_type = get_bigquery_type(kpi_type)
             schema.append(bigquery.SchemaField(col_name, bq_type))
             print(f"📊 Column: {col_name} -> {bq_type}")
-        
+
         table = bigquery.Table(table_id, schema=schema)
         bq_client.create_table(table)
         time.sleep(2)
         print(f"✅ Created typed table: {table_id}")
-    
+
     return table_id, kpi_type_lookup
 
 
@@ -331,7 +313,7 @@ def sync_bigquery_schema(uid, folder_id, kpi_list):
     clean_uid = re.sub(r'[^a-zA-Z0-9_]', '_', uid).lower()
     clean_folder = re.sub(r'[^a-zA-Z0-9_]', '_', folder_id).lower()
     table_id = f"{PROJECT_ID}.{DATASET}.{clean_uid}_{clean_folder}"
-    
+
     try:
         table = bq_client.get_table(table_id)
     except Exception:
@@ -346,7 +328,7 @@ def sync_bigquery_schema(uid, folder_id, kpi_list):
 
     existing_cols = {field.name for field in table.schema}
     new_fields = []
-    
+
     for kpi in kpi_list:
         col_name = f"kpi_{re.sub(r'[^a-zA-Z0-9_]', '_', kpi).lower()}"
         if col_name not in existing_cols:
@@ -356,7 +338,7 @@ def sync_bigquery_schema(uid, folder_id, kpi_list):
         table.schema += new_fields
         bq_client.update_table(table, ["schema"])
         print(f"✅ Table {table_id} updated with new columns.")
-        
+
     return table_id
 
 # ==========================================
@@ -367,7 +349,7 @@ def setup_account():
     if request.method == "OPTIONS": return _build_cors_preflight_response()
     uid = get_user_id(request)
     if not uid: return jsonify({"error": "Unauthorized"}), 401
-    
+
     try:
         db.collection("tenants").document(uid).set({
             "account_status": "active",
@@ -386,7 +368,7 @@ def create_folder():
     if request.method == "OPTIONS": return _build_cors_preflight_response()
     uid = get_user_id(request)
     if not uid: return jsonify({"error": "Unauthorized"}), 401
-    
+
     try:
         payload = request.get_json()
         name = payload.get("name")
@@ -395,7 +377,7 @@ def create_folder():
 
         storage_client = storage.Client()
         bucket = storage_client.bucket(BUCKET_NAME)
-        
+
         bucket.blob(f"incoming/{uid}/{folder_id}/master/.placeholder").upload_from_string("init")
         bucket.blob(f"incoming/{uid}/{folder_id}/batch/.placeholder").upload_from_string("init")
 
@@ -417,37 +399,51 @@ def create_folder():
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 🧠 3. MASTER PDF ANALYSIS
+# 🧠 3. MASTER PDF ANALYSIS (PROMPT ADJUSTED ONLY)
 # ==========================================
 @app.route("/analyze-master", methods=["POST", "OPTIONS"])
 def analyze_master():
     if request.method == "OPTIONS": return _build_cors_preflight_response()
     uid = get_user_id(request)
     if not uid: return jsonify({"error": "Unauthorized"}), 401
-    
+
     payload = request.get_json()
-    file_path = payload.get("file_path") 
+    file_path = payload.get("file_path")
     context_hint = payload.get("context_hint", "")
-    
+
     print(f"🔍 LOG: Analyzing master with context: {context_hint}")
 
     try:
         storage_client = storage.Client()
         bucket = storage_client.bucket(BUCKET_NAME)
         blob = bucket.blob(file_path)
-        
+
         if not blob.exists():
             return jsonify({"error": f"File {file_path} not found"}), 404
 
         pdf_bytes = blob.download_as_bytes()
 
+        # ✅ ADJUSTED PROMPT ONLY (no other code changes)
         prompt = f"""
-        Extract all data labels and headers found in this document. 
-        USER CONTEXT: {context_hint if context_hint else "Generic business document."}
-        Return ONLY a valid JSON object of {{field_name: example_value}}. 
-        Ensure keys are descriptive and relevant to the provided USER CONTEXT.
-        """
-        
+You are analyzing a MASTER PDF template to discover KPI fields users will want to extract.
+
+USER CONTEXT: {context_hint if context_hint else "Generic business document."}
+
+Find and return:
+- Key/value labels (Invoice No, Total Amount, Date, Vendor, Reference, Status, etc.)
+- If there are tables: include meaningful column headers as fields too (Item, Qty, Unit Price, Total, etc.)
+- Prefer business KPIs over generic words.
+
+IMPORTANT:
+- Do NOT output every cell value.
+- Focus on stable labels/headers that repeat across similar PDFs.
+
+Return ONLY valid JSON object:
+{{"field_name": "example_value"}}
+
+JSON only. No explanation.
+"""
+
         resp = client.models.generate_content(
             model="gemini-2.0-flash-001",
             contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
@@ -456,17 +452,17 @@ def analyze_master():
                 temperature=0.0
             ),
         )
-        
+
         raw_text = resp.text.strip()
         if raw_text.startswith("```"):
             raw_text = re.sub(r'^```json\s*|```$', '', raw_text, flags=re.MULTILINE)
-        
+
         detected_dict = json.loads(raw_text)
         if isinstance(detected_dict, list):
             detected_dict = detected_dict[0] if len(detected_dict) > 0 else {}
-        
+
         formatted_kpis = [{"key": k, "value": str(v)} for k, v in detected_dict.items()]
-        
+
         return jsonify({"detected_kpis": formatted_kpis}), 200
     except Exception as e:
         print(f"❌ Analyze Master Crash: {str(e)}")
@@ -480,7 +476,7 @@ def confirm_kpis():
     if request.method == "OPTIONS": return _build_cors_preflight_response()
     uid = get_user_id(request)
     if not uid: return jsonify({"error": "Unauthorized"}), 401
-    
+
     try:
         payload = request.get_json()
         folder_id = payload.get("folder_id")
@@ -490,7 +486,7 @@ def confirm_kpis():
         # 🧠 Use AI to infer types for all KPIs at once
         print(f"🧠 Calling Gemini AI to analyze {len(kpi_samples)} KPIs...")
         kpi_types = infer_kpi_types_with_ai(kpi_samples)
-        
+
         # Build the full KPI metadata with types
         kpi_metadata = []
         for kpi_name in selected_kpis:
@@ -510,10 +506,10 @@ def confirm_kpis():
             "is_trained": True,
             "status": "active"
         })
-        
+
         # 📊 Create BigQuery table with TYPED schema
         sync_bigquery_schema_typed(uid, folder_id, kpi_metadata)
-        
+
         print(f"✅ KPIs confirmed with AI-inferred types: {kpi_metadata}")
         return jsonify({"status": "success", "kpi_metadata": kpi_metadata}), 200
     except Exception as e:
@@ -528,37 +524,37 @@ def get_kpis():
     if request.method == "OPTIONS": return _build_cors_preflight_response()
     uid = get_user_id(request)
     if not uid: return jsonify({"error": "Unauthorized"}), 401
-    
+
     folder_id = request.args.get("folder_id")
     owner_id = request.args.get("owner_id")
-    
+
     if not folder_id: return jsonify({"error": "folder_id required"}), 400
 
     try:
         target_uid = owner_id if owner_id else uid
-        
+
         folder_ref = db.collection("tenants").document(target_uid).collection("folders").document(folder_id).get()
-        
+
         if not folder_ref.exists:
             return jsonify({"error": "Folder not found"}), 404
-            
+
         folder_data = folder_ref.to_dict()
-        
+
         # Permission check
         is_owner = uid == folder_data.get("owner")
         has_share = uid in folder_data.get("shared_with", {})
-        
+
         if not is_owner and not has_share:
             shares_query = db.collection("shares").where("folderId", "==", folder_id).where("ownerId", "==", target_uid).get()
             if len(list(shares_query)) > 0:
                 has_share = True
-        
+
         if not is_owner and not has_share:
             return jsonify({"error": "Access denied"}), 403
-        
+
         # Return pre-computed metadata if available (from AI inference)
         kpi_metadata = folder_data.get("kpi_metadata")
-        
+
         if kpi_metadata:
             # Use pre-computed AI-inferred types
             return jsonify({
@@ -567,17 +563,17 @@ def get_kpis():
                 "context_hint": folder_data.get("context_hint", ""),
                 "status": folder_data.get("status", "unknown")
             }), 200
-        
+
         # Fallback: compute types on-the-fly for older folders
         selected_kpis_raw = folder_data.get("selected_kpis", [])
         kpi_samples = folder_data.get("kpi_samples", {})
-        
+
         # Try AI inference if samples exist
         if kpi_samples:
             kpi_types = infer_kpi_types_with_ai(kpi_samples)
         else:
             kpi_types = {}
-        
+
         selected_kpis_with_types = []
         for kpi_name in selected_kpis_raw:
             sample_value = kpi_samples.get(kpi_name, "")
@@ -587,14 +583,14 @@ def get_kpis():
                 "sample_value": sample_value,
                 "type": kpi_type
             })
-        
+
         return jsonify({
             "is_trained": folder_data.get("is_trained", False),
             "selected_kpis": selected_kpis_with_types,
             "context_hint": folder_data.get("context_hint", ""),
             "status": folder_data.get("status", "unknown")
         }), 200
-        
+
     except Exception as e:
         print(f"❌ Get KPIs Error: {e}")
         return jsonify({"error": str(e)}), 500
@@ -605,10 +601,10 @@ def get_kpis():
 @app.route("/upload-batch-file", methods=["POST", "OPTIONS"])
 def upload_batch_file():
     if request.method == "OPTIONS": return _build_cors_preflight_response()
-    
+
     uid = get_user_id(request)
     user_email = get_user_email(request)
-    
+
     if not uid or not user_email:
         return jsonify({"error": "Unauthorized"}), 401
 
@@ -644,7 +640,7 @@ def upload_batch_file():
         storage_client = storage.Client()
         bucket = storage_client.bucket(BUCKET_NAME)
         blob = bucket.blob(storage_path)
-        
+
         blob.upload_from_file(file, content_type="application/pdf")
 
         print(f"✅ Shared user {user_email} uploaded {sanitized_filename} to {storage_path}")
@@ -660,12 +656,12 @@ def upload_batch_file():
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 🚜 7. BATCH ENGINE (GCS TRIGGER HANDLER) - WITH TYPED INSERTION
+# 🚜 7. BATCH ENGINE (GCS TRIGGER HANDLER) - KPI PROMPT ADJUSTED ONLY
 # ==========================================
 @app.route("/", methods=["POST", "OPTIONS"])
 def gcs_trigger_handler():
     if request.method == "OPTIONS": return _build_cors_preflight_response()
-    
+
     payload = request.get_json(silent=True) or {}
     data = payload.get("data", payload)
     file_path = data.get("name", "")
@@ -676,7 +672,7 @@ def gcs_trigger_handler():
     parts = file_path.split("/")
     if len(parts) < 5 or parts[0] != "incoming" or parts[3] != "batch":
         return jsonify({"status": "ignored_path"}), 200
-    
+
     uid = parts[1]
     folder_id = parts[2]
 
@@ -684,7 +680,7 @@ def gcs_trigger_handler():
         folder_ref = db.collection("tenants").document(uid).collection("folders").document(folder_id).get()
         if not folder_ref.exists:
             return jsonify({"error": "Folder not trained"}), 200
-            
+
         folder_data = folder_ref.to_dict()
         kpis = folder_data.get("selected_kpis", [])
         kpi_metadata = folder_data.get("kpi_metadata", [])
@@ -700,12 +696,51 @@ def gcs_trigger_handler():
         blob = source_bucket.blob(file_path)
         pdf_bytes = blob.download_as_bytes()
 
+        # ✅ ADJUSTED PROMPT ONLY (no other code changes)
         prompt = f"""
-        Extract the values for these specific keys: {kpis}. 
-        CONTEXT: {context_hint if context_hint else "Generic data extraction."}
-        Return ONLY a JSON object. If a value is missing, return "N/A".
-        """
-        
+You are extracting KPI values from a PDF.
+
+CONTEXT (domain hint): {context_hint if context_hint else "Generic business document."}
+
+KPIs (use exact key names):
+{kpis}
+
+CRITICAL RULES (read carefully):
+1) Output must be ONLY valid JSON object in this exact form:
+   {{ "KPI_NAME_1": "value or N/A", "KPI_NAME_2": "value or N/A", ... }}
+   No extra keys, no explanations.
+
+2) Table-aware behavior:
+   - If the document contains tables, DO NOT treat each cell as an independent value.
+   - Identify the table structure (column headers + rows).
+   - For each KPI, select the correct value by understanding:
+     • which column/header matches the KPI label,
+     • which row is relevant (e.g., latest date row, totals row, summary row, matching identifier row),
+     • totals/subtotals/grand totals (prefer grand total if KPI implies it).
+   - If multiple candidate values exist in a table, choose the most semantically correct one and ignore the rest.
+   - If the KPI refers to a row identifier (e.g., product name, account, item, category), match that row.
+
+3) Human-like label/value linking (pattern connection):
+   - Many KPIs appear as label/value pairs, sometimes split across lines.
+   - Treat these as connected if they are:
+     • on the same line (e.g., "Total Amount: 1,250"),
+     • on adjacent lines (label on one line, value on next),
+     • aligned visually in the same row/area (even without ":"),
+     • near each other with strong association words (Total, Amount, Date, ID, Status, Vendor, Customer, Reference).
+   - If you see a label but the value is nearby, capture it (even if formatting is messy).
+
+4) Duplicate fields:
+   - If the same KPI appears multiple times, prefer the value in the main body (not header/footer).
+   - Prefer the most complete value (e.g., "KWD 1,250.000" over "1,250").
+
+5) Value formatting:
+   - Return values exactly as shown in the PDF (keep currency symbols, %, commas).
+   - If a value truly does not exist, return "N/A".
+   - Do not invent values.
+
+Now return the JSON object only.
+"""
+
         resp = client.models.generate_content(
             model="gemini-2.0-flash-001",
             contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
@@ -714,44 +749,44 @@ def gcs_trigger_handler():
                 temperature=0.0
             ),
         )
-        
+
         raw_extract = resp.text.strip()
         if raw_extract.startswith("```"):
             raw_extract = re.sub(r'^```json\s*|```$', '', raw_extract, flags=re.MULTILINE)
-        
+
         extracted_data = json.loads(raw_extract)
         if isinstance(extracted_data, list):
             extracted_data = extracted_data[0]
 
         owner_uid = folder_data.get("owner", uid)
-        
+
         # Use typed schema sync if metadata exists
         if kpi_metadata:
             table_id, _ = sync_bigquery_schema_typed(owner_uid, folder_id, kpi_metadata)
         else:
             table_id = sync_bigquery_schema(owner_uid, folder_id, kpis)
-        
+
         # Build row with properly typed values
         row = {
             "row_id": f"row_{int(time.time())}",
             "file_name": file_path.split("/")[-1],
             "uploaded_at": datetime.datetime.utcnow().isoformat()
         }
-        
+
         for k in kpis:
             safe_col_name = f"kpi_{re.sub(r'[^a-zA-Z0-9_]', '_', k).lower()}"
             raw_value = extracted_data.get(k, "N/A")
             kpi_type = kpi_type_lookup.get(k, "string")
-            
+
             # Convert value to proper type for BigQuery
             typed_value = convert_value_for_bq(raw_value, kpi_type)
             row[safe_col_name] = typed_value
-            
+
             print(f"📊 {k}: '{raw_value}' -> {typed_value} ({kpi_type})")
 
         bq_client = bigquery.Client()
         errors = bq_client.insert_rows_json(table_id, [row])
-        
+
         if errors:
             print(f"❌ BigQuery Insert Errors: {errors}")
             return jsonify({"error": "BigQuery Insert Failed", "details": str(errors)}), 200
@@ -775,15 +810,15 @@ def get_results():
     if request.method == "OPTIONS": return _build_cors_preflight_response()
     uid = get_user_id(request)
     if not uid: return jsonify({"error": "Unauthorized"}), 401
-    
+
     folder_id = request.args.get("folder_id")
     owner_id = request.args.get("owner_id")
-    
+
     if not folder_id: return jsonify({"error": "folder_id required"}), 400
 
     try:
         target_uid = owner_id if owner_id else uid
-        
+
         folder_ref = db.collection("tenants").document(target_uid).collection("folders").document(folder_id).get()
         folder_data = None
 
@@ -813,12 +848,12 @@ def get_results():
         clean_uid = re.sub(r'[^a-zA-Z0-9_]', '_', owner_uid).lower()
         clean_folder = re.sub(r'[^a-zA-Z0-9_]', '_', folder_id).lower()
         table_id = f"{PROJECT_ID}.{DATASET}.{clean_uid}_{clean_folder}"
-        
+
         bq_client = bigquery.Client()
         query = f"SELECT * FROM `{table_id}` ORDER BY uploaded_at DESC LIMIT 100"
         query_job = bq_client.query(query)
         results = [dict(row) for row in query_job]
-        
+
         return jsonify({"results": results}), 200
     except Exception as e:
         print(f"❌ Fetch Results Error: {e}")
@@ -826,6 +861,3 @@ def get_results():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
-
-
-
