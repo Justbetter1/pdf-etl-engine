@@ -112,7 +112,7 @@ def convert_value_for_bq(value, ai_type):
     return val
 
 # ==========================================
-# MASTER ANALYSIS (UNCHANGED)
+# ROUTES: analyze-master (detect KPI labels)
 # ==========================================
 @app.route("/analyze-master", methods=["POST", "OPTIONS"])
 def analyze_master():
@@ -155,7 +155,12 @@ Return ONLY a JSON object:
     if text.startswith("```"):
         text = re.sub(r'^```json\s*|```$', '', text)
 
-    data = json.loads(text)
+    try:
+        data = json.loads(text)
+    except Exception:
+        # fallback: return raw text for debugging
+        return jsonify({"error": "Invalid AI output", "raw": text}), 500
+
     if isinstance(data, list):
         data = data[0] if data else {}
 
@@ -164,7 +169,87 @@ Return ONLY a JSON object:
     }), 200
 
 # ==========================================
-# 🔥 BATCH ENGINE (MAIN FIX HERE)
+# ROUTE: create-folder (restored from old working code)
+# ==========================================
+@app.route("/create-folder", methods=["POST", "OPTIONS"])
+def create_folder():
+    if request.method == "OPTIONS":
+        return _build_cors_preflight_response()
+
+    uid = get_user_id(request)
+    if not uid:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    try:
+        payload = request.get_json()
+        name = payload.get("name")
+        context_hint = payload.get("context_hint", "")
+        if not name:
+            return jsonify({"error": "Missing folder name"}), 400
+
+        folder_id = re.sub(r'[^a-zA-Z0-9_]', '_', name).lower()
+
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(BUCKET_NAME)
+
+        # Create placeholder blobs so the folder exists in GCS
+        bucket.blob(f"incoming/{uid}/{folder_id}/master/.placeholder").upload_from_string("init")
+        bucket.blob(f"incoming/{uid}/{folder_id}/batch/.placeholder").upload_from_string("init")
+
+        folder_data = {
+            "display_name": name,
+            "folder_id": folder_id,
+            "context_hint": context_hint,
+            "is_trained": False,
+            "status": "waiting_for_training",
+            "created_at": datetime.datetime.utcnow().isoformat(),
+            "owner": uid,
+            "shared_with": {},
+            "selected_kpis": [],
+            "kpi_metadata": []
+        }
+        db.collection("tenants").document(uid).collection("folders").document(folder_id).set(folder_data)
+
+        return jsonify({"status": "success", "folder_id": folder_id, "folder": folder_data}), 200
+    except Exception as e:
+        print(f"❌ Create Folder Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# ==========================================
+# ROUTE: get-kpis (fetch folder KPIs and metadata)
+# ==========================================
+@app.route("/get-kpis", methods=["GET", "OPTIONS"])
+def get_kpis():
+    if request.method == "OPTIONS":
+        return _build_cors_preflight_response()
+
+    uid = get_user_id(request)
+    if not uid:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    folder_id = request.args.get("folder_id")
+    if not folder_id:
+        return jsonify({"error": "Missing folder_id"}), 400
+
+    folder_ref = db.collection("tenants").document(uid).collection("folders").document(folder_id).get()
+    if not folder_ref.exists:
+        return jsonify({"error": "Folder not found"}), 404
+
+    folder = folder_ref.to_dict()
+    return jsonify({
+        "selected_kpis": folder.get("selected_kpis", []),
+        "kpi_metadata": folder.get("kpi_metadata", []),
+        "folder": {
+            "display_name": folder.get("display_name"),
+            "folder_id": folder.get("folder_id"),
+            "context_hint": folder.get("context_hint"),
+            "status": folder.get("status"),
+            "is_trained": folder.get("is_trained", False)
+        }
+    }), 200
+
+# ==========================================
+# 🔥 BATCH ENGINE (TABLE-AWARE KPI EXTRACTION)
 # ==========================================
 @app.route("/", methods=["POST", "OPTIONS"])
 def gcs_trigger_handler():
@@ -201,7 +286,7 @@ def gcs_trigger_handler():
     blob = bucket.blob(file_path)
     pdf_bytes = blob.download_as_bytes()
 
-    # ✅ NEW TABLE-AWARE + SEMANTIC PROMPT
+    # Table-aware prompt with explicit column-header instruction
     prompt = f"""
 You are extracting KPI values from a business PDF.
 
@@ -213,7 +298,7 @@ KPIs:
 
 RULES:
 1. Detect if document has tables.
-2. If tables exist, understand rows + columns (do NOT treat cells independently).
+2. If tables exist, ONLY column headers are KPI field names. Row values are sample data for those KPI columns. Do NOT treat individual cells as separate KPIs.
 3. Prefer totals / summary rows for totals KPIs.
 4. If multiple rows exist and no clear match → return "N/A".
 5. If no tables exist, use semantic label/value understanding.
@@ -237,9 +322,13 @@ Return ONLY valid JSON:
     if raw.startswith("```"):
         raw = re.sub(r'^```json\s*|```$', '', raw)
 
-    extracted_data = json.loads(raw)
+    try:
+        extracted_data = json.loads(raw)
+    except Exception:
+        print("❌ JSON Decode Error from AI:", raw)
+        return jsonify({"error": "Invalid AI output", "raw": raw}), 500
 
-    # ✅ FIX: MERGE ALL OBJECTS (NO KPI LOSS)
+    # Merge list outputs into single dict if needed
     if isinstance(extracted_data, list):
         merged = {}
         for obj in extracted_data:
@@ -266,8 +355,12 @@ Return ONLY valid JSON:
     if errors:
         print("❌ BQ Errors:", errors)
 
-    bucket.copy_blob(blob, bucket, file_path.replace("incoming/", "processed/"))
-    blob.delete()
+    # Move file to processed and delete original
+    try:
+        bucket.copy_blob(blob, bucket, file_path.replace("incoming/", "processed/"))
+        blob.delete()
+    except Exception as e:
+        print("⚠️ GCS move/delete error:", e)
 
     print(f"✅ Processed {file_path}")
     return jsonify({"status": "success"}), 200
