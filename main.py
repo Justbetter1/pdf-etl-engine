@@ -16,12 +16,22 @@ from dateutil import parser as date_parser  # Add to requirements.txt: python-da
 app = Flask(__name__)
 
 # 2. Strong CORS Configuration
-CORS(app, resources={r"/*": {
-    "origins": "*",
-    "allow_headers": ["Authorization", "Content-Type", "Accept"],
-    "methods": ["GET", "POST", "OPTIONS"],
-    "max_age": 3600
-}}, supports_credentials=True)
+CORS(
+    app,
+    resources={
+        r"/*": {
+            "origins": [
+                "https://sentinelcloud.tech",
+                "https://www.sentinelcloud.tech"
+            ],
+            "allow_headers": ["Authorization", "Content-Type", "Accept"],
+            "methods": ["GET", "POST", "OPTIONS"],
+            "max_age": 3600
+        }
+    },
+    supports_credentials=True
+)
+
 
 # 3. Configuration
 PROJECT_ID = "pdf-etl-479411"
@@ -808,3 +818,4 @@ def get_results():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
