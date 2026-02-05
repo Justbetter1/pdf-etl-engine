@@ -63,7 +63,7 @@ def _build_cors_preflight_response():
     return r, 204
 
 # ==========================================
-# SAFE JSON FROM AI (🔥 FIX)
+# SAFE JSON PARSER (CRITICAL FIX)
 # ==========================================
 def safe_json(text):
     if not text:
@@ -111,7 +111,7 @@ def convert_value_for_bq(value, ai_type):
     return val
 
 # ==========================================
-# ANALYZE MASTER (JSON-SAFE)
+# ROUTE: ANALYZE MASTER (FIXED)
 # ==========================================
 @app.route("/analyze-master", methods=["POST", "OPTIONS"])
 def analyze_master():
@@ -133,7 +133,7 @@ def analyze_master():
     blob = bucket.blob(file_path)
 
     if not blob.exists():
-        return jsonify({"error": "File not found in bucket"}), 404
+        return jsonify({"error": "File not found"}), 404
 
     pdf_bytes = blob.download_as_bytes()
 
@@ -141,12 +141,12 @@ def analyze_master():
 Analyze this MASTER PDF to detect stable KPI labels.
 
 Context:
-{context_hint}
+{context_hint or "Generic business document"}
 
 Rules:
-- Return JSON ONLY
+- JSON only
 - Keys = KPI names
-- Ignore row data
+- Ignore row values
 
 Format:
 {{ "KPI Name": "" }}
@@ -167,9 +167,8 @@ Format:
         "detected_kpis": [{"key": k, "value": ""} for k in data.keys()]
     }), 200
 
-
 # ==========================================
-# CREATE FOLDER (UNCHANGED)
+# ROUTE: CREATE FOLDER
 # ==========================================
 @app.route("/create-folder", methods=["POST", "OPTIONS"])
 def create_folder():
@@ -180,9 +179,12 @@ def create_folder():
     if not uid:
         return jsonify({"error": "Unauthorized"}), 401
 
-    payload = request.get_json()
+    payload = request.get_json(silent=True) or {}
     name = payload.get("name")
     context_hint = payload.get("context_hint", "")
+
+    if not name:
+        return jsonify({"error": "Missing folder name"}), 400
 
     folder_id = re.sub(r'[^a-zA-Z0-9_]', '_', name).lower()
     bucket = storage.Client().bucket(BUCKET_NAME)
@@ -204,7 +206,7 @@ def create_folder():
     return jsonify({"status": "success", "folder_id": folder_id}), 200
 
 # ==========================================
-# GCS BATCH ENGINE (ALL KPI FIX)
+# ROUTE: BATCH PDF ENGINE
 # ==========================================
 @app.route("/", methods=["POST", "OPTIONS"])
 def gcs_trigger_handler():
@@ -223,8 +225,11 @@ def gcs_trigger_handler():
         return jsonify({"status": "ignored_path"}), 200
 
     uid, folder_id = parts[1], parts[2]
-    folder = db.collection("tenants").document(uid).collection("folders").document(folder_id).get().to_dict()
+    folder_ref = db.collection("tenants").document(uid).collection("folders").document(folder_id).get()
+    if not folder_ref.exists:
+        return jsonify({"status": "not_trained"}), 200
 
+    folder = folder_ref.to_dict()
     kpis = folder.get("selected_kpis", [])
     meta = {k["name"]: k["type"] for k in folder.get("kpi_metadata", [])}
 
@@ -232,13 +237,13 @@ def gcs_trigger_handler():
     pdf_bytes = blob.download_as_bytes()
 
     prompt = f"""
-Extract ALL KPI values.
+Extract KPI values from this PDF.
 
 KPIs:
 {kpis}
 
 Rules:
-- Tables → use column headers
+- Tables → column headers
 - Prefer totals
 - Never guess
 - JSON only
@@ -282,4 +287,3 @@ Rules:
 # ==========================================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
-
