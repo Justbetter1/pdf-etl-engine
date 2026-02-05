@@ -122,11 +122,19 @@ def analyze_master():
     if not uid:
         return jsonify({"error": "Unauthorized"}), 401
 
-    payload = request.get_json()
+    payload = request.get_json(silent=True) or {}
     file_path = payload.get("file_path")
     context_hint = payload.get("context_hint", "")
 
-    blob = storage.Client().bucket(BUCKET_NAME).blob(file_path)
+    if not file_path:
+        return jsonify({"error": "Missing file_path"}), 400
+
+    bucket = storage.Client().bucket(BUCKET_NAME)
+    blob = bucket.blob(file_path)
+
+    if not blob.exists():
+        return jsonify({"error": "File not found in bucket"}), 404
+
     pdf_bytes = blob.download_as_bytes()
 
     prompt = f"""
@@ -158,6 +166,7 @@ Format:
     return jsonify({
         "detected_kpis": [{"key": k, "value": ""} for k in data.keys()]
     }), 200
+
 
 # ==========================================
 # CREATE FOLDER (UNCHANGED)
@@ -273,3 +282,4 @@ Rules:
 # ==========================================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
