@@ -219,9 +219,7 @@ def convert_value_for_bq(value, ai_type: str):
 
     if ai_type == "number":
         try:
-            # Remove currency symbols, commas, spaces, percentage signs
             cleaned = re.sub(r'[$€£¥,\s%]', '', val_str)
-            # Handle parentheses for negative numbers: (100) -> -100
             if cleaned.startswith('(') and cleaned.endswith(')'):
                 cleaned = '-' + cleaned[1:-1]
             return float(cleaned)
@@ -232,12 +230,12 @@ def convert_value_for_bq(value, ai_type: str):
     elif ai_type == "date":
         try:
             parsed_date = date_parser.parse(val_str, fuzzy=True)
-            return parsed_date.strftime('%Y-%m-%d')  # BigQuery DATE format
+            return parsed_date.strftime('%Y-%m-%d')
         except (ValueError, TypeError):
             print(f"⚠️ Could not parse '{value}' as date, returning None")
             return None
 
-    else:  # categorical or string
+    else:
         return val_str
 
 
@@ -245,16 +243,11 @@ def convert_value_for_bq(value, ai_type: str):
 # 📊 BIGQUERY SCHEMA SYNC & TABLE CREATION (TYPED)
 # ==========================================
 def sync_bigquery_schema_typed(uid, folder_id, kpi_metadata):
-    """
-    Create or update BigQuery table with dynamically typed columns
-    based on AI-inferred KPI types.
-    """
     bq_client = bigquery.Client()
     clean_uid = re.sub(r'[^a-zA-Z0-9_]', '_', uid).lower()
     clean_folder = re.sub(r'[^a-zA-Z0-9_]', '_', folder_id).lower()
     table_id = f"{PROJECT_ID}.{DATASET}.{clean_uid}_{clean_folder}"
 
-    # Build type lookup from kpi_metadata
     kpi_type_lookup = {}
     for kpi in kpi_metadata:
         kpi_name = kpi.get("name", "")
@@ -282,7 +275,6 @@ def sync_bigquery_schema_typed(uid, folder_id, kpi_metadata):
             print(f"✅ Table {table_id} updated with {len(new_fields)} new typed columns.")
 
     except Exception:
-        # Table doesn't exist - create with full typed schema
         print(f"📊 Creating new table with typed schema: {table_id}")
 
         schema = [
@@ -308,7 +300,6 @@ def sync_bigquery_schema_typed(uid, folder_id, kpi_metadata):
 
 
 def sync_bigquery_schema(uid, folder_id, kpi_list):
-    """Legacy function for backwards compatibility - uses STRING for all columns."""
     bq_client = bigquery.Client()
     clean_uid = re.sub(r'[^a-zA-Z0-9_]', '_', uid).lower()
     clean_folder = re.sub(r'[^a-zA-Z0-9_]', '_', folder_id).lower()
@@ -458,10 +449,16 @@ JSON only. No explanation.
             raw_text = re.sub(r'^```json\s*|```$', '', raw_text, flags=re.MULTILINE)
 
         detected_dict = json.loads(raw_text)
-        if isinstance(detected_dict, list):
-            detected_dict = detected_dict[0] if len(detected_dict) > 0 else {}
 
-        formatted_kpis = [{"key": k, "value": str(v)} for k, v in detected_dict.items()]
+        # ✅ FIX: if Gemini returns list of objects, merge them (instead of taking only [0])
+        if isinstance(detected_dict, list):
+            merged = {}
+            for item in detected_dict:
+                if isinstance(item, dict):
+                    merged.update(item)
+            detected_dict = merged
+
+        formatted_kpis = [{"key": k, "value": str(v)} for k, v in (detected_dict or {}).items()]
 
         return jsonify({"detected_kpis": formatted_kpis}), 200
     except Exception as e:
@@ -483,11 +480,9 @@ def confirm_kpis():
         selected_kpis = payload.get("selected_kpis")
         kpi_samples = payload.get("kpi_samples", {})
 
-        # 🧠 Use AI to infer types for all KPIs at once
         print(f"🧠 Calling Gemini AI to analyze {len(kpi_samples)} KPIs...")
         kpi_types = infer_kpi_types_with_ai(kpi_samples)
 
-        # Build the full KPI metadata with types
         kpi_metadata = []
         for kpi_name in selected_kpis:
             sample_value = kpi_samples.get(kpi_name, "")
@@ -498,7 +493,6 @@ def confirm_kpis():
                 "type": inferred_type
             })
 
-        # Store everything in Firestore
         db.collection("tenants").document(uid).collection("folders").document(folder_id).update({
             "selected_kpis": selected_kpis,
             "kpi_samples": kpi_samples,
@@ -507,7 +501,6 @@ def confirm_kpis():
             "status": "active"
         })
 
-        # 📊 Create BigQuery table with TYPED schema
         sync_bigquery_schema_typed(uid, folder_id, kpi_metadata)
 
         print(f"✅ KPIs confirmed with AI-inferred types: {kpi_metadata}")
@@ -540,7 +533,6 @@ def get_kpis():
 
         folder_data = folder_ref.to_dict()
 
-        # Permission check
         is_owner = uid == folder_data.get("owner")
         has_share = uid in folder_data.get("shared_with", {})
 
@@ -552,11 +544,9 @@ def get_kpis():
         if not is_owner and not has_share:
             return jsonify({"error": "Access denied"}), 403
 
-        # Return pre-computed metadata if available (from AI inference)
         kpi_metadata = folder_data.get("kpi_metadata")
 
         if kpi_metadata:
-            # Use pre-computed AI-inferred types
             return jsonify({
                 "is_trained": folder_data.get("is_trained", False),
                 "selected_kpis": kpi_metadata,
@@ -564,11 +554,9 @@ def get_kpis():
                 "status": folder_data.get("status", "unknown")
             }), 200
 
-        # Fallback: compute types on-the-fly for older folders
         selected_kpis_raw = folder_data.get("selected_kpis", [])
         kpi_samples = folder_data.get("kpi_samples", {})
 
-        # Try AI inference if samples exist
         if kpi_samples:
             kpi_types = infer_kpi_types_with_ai(kpi_samples)
         else:
@@ -656,7 +644,7 @@ def upload_batch_file():
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 🚜 7. BATCH ENGINE (GCS TRIGGER HANDLER) - KPI PROMPT ADJUSTED ONLY
+# 🚜 7. BATCH ENGINE (GCS TRIGGER HANDLER) - KPI PROMPT + LIST-MERGE FIX
 # ==========================================
 @app.route("/", methods=["POST", "OPTIONS"])
 def gcs_trigger_handler():
@@ -686,7 +674,6 @@ def gcs_trigger_handler():
         kpi_metadata = folder_data.get("kpi_metadata", [])
         context_hint = folder_data.get("context_hint", "")
 
-        # Build type lookup from metadata
         kpi_type_lookup = {}
         for kpi in kpi_metadata:
             kpi_type_lookup[kpi.get("name", "")] = kpi.get("type", "string")
@@ -696,7 +683,7 @@ def gcs_trigger_handler():
         blob = source_bucket.blob(file_path)
         pdf_bytes = blob.download_as_bytes()
 
-        # ✅ ADJUSTED PROMPT ONLY (no other code changes)
+        # ✅ PROMPT UPDATED: force returning ALL KPI keys always (no skipping)
         prompt = f"""
 You are extracting KPI values from a PDF.
 
@@ -710,7 +697,11 @@ CRITICAL RULES (read carefully):
    {{ "KPI_NAME_1": "value or N/A", "KPI_NAME_2": "value or N/A", ... }}
    No extra keys, no explanations.
 
-2) Table-aware behavior:
+2) You MUST include EVERY KPI key from the KPI list in the output JSON.
+   - If you cannot find a KPI, set its value to "N/A".
+   - Do NOT omit keys.
+
+3) Table-aware behavior:
    - If the document contains tables, DO NOT treat each cell as an independent value.
    - Identify the table structure (column headers + rows).
    - For each KPI, select the correct value by understanding:
@@ -720,7 +711,7 @@ CRITICAL RULES (read carefully):
    - If multiple candidate values exist in a table, choose the most semantically correct one and ignore the rest.
    - If the KPI refers to a row identifier (e.g., product name, account, item, category), match that row.
 
-3) Human-like label/value linking (pattern connection):
+4) Human-like label/value linking (pattern connection):
    - Many KPIs appear as label/value pairs, sometimes split across lines.
    - Treat these as connected if they are:
      • on the same line (e.g., "Total Amount: 1,250"),
@@ -729,11 +720,11 @@ CRITICAL RULES (read carefully):
      • near each other with strong association words (Total, Amount, Date, ID, Status, Vendor, Customer, Reference).
    - If you see a label but the value is nearby, capture it (even if formatting is messy).
 
-4) Duplicate fields:
+5) Duplicate fields:
    - If the same KPI appears multiple times, prefer the value in the main body (not header/footer).
    - Prefer the most complete value (e.g., "KWD 1,250.000" over "1,250").
 
-5) Value formatting:
+6) Value formatting:
    - Return values exactly as shown in the PDF (keep currency symbols, %, commas).
    - If a value truly does not exist, return "N/A".
    - Do not invent values.
@@ -755,18 +746,22 @@ Now return the JSON object only.
             raw_extract = re.sub(r'^```json\s*|```$', '', raw_extract, flags=re.MULTILINE)
 
         extracted_data = json.loads(raw_extract)
+
+        # ✅ FIX: if Gemini returns list of dicts, MERGE them (instead of taking only [0])
         if isinstance(extracted_data, list):
-            extracted_data = extracted_data[0]
+            merged = {}
+            for item in extracted_data:
+                if isinstance(item, dict):
+                    merged.update(item)
+            extracted_data = merged
 
         owner_uid = folder_data.get("owner", uid)
 
-        # Use typed schema sync if metadata exists
         if kpi_metadata:
             table_id, _ = sync_bigquery_schema_typed(owner_uid, folder_id, kpi_metadata)
         else:
             table_id = sync_bigquery_schema(owner_uid, folder_id, kpis)
 
-        # Build row with properly typed values
         row = {
             "row_id": f"row_{int(time.time())}",
             "file_name": file_path.split("/")[-1],
@@ -777,11 +772,8 @@ Now return the JSON object only.
             safe_col_name = f"kpi_{re.sub(r'[^a-zA-Z0-9_]', '_', k).lower()}"
             raw_value = extracted_data.get(k, "N/A")
             kpi_type = kpi_type_lookup.get(k, "string")
-
-            # Convert value to proper type for BigQuery
             typed_value = convert_value_for_bq(raw_value, kpi_type)
             row[safe_col_name] = typed_value
-
             print(f"📊 {k}: '{raw_value}' -> {typed_value} ({kpi_type})")
 
         bq_client = bigquery.Client()
