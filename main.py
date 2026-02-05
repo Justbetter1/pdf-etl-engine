@@ -79,11 +79,12 @@ def get_user_email(req):
 
 def _build_cors_preflight_response():
     response = make_response()
-    response.headers.add("Access-Control-Allow-Origin", "*")
+    response.headers.add("Access-Control-Allow-Origin", "https://sentinelcloud.tech")
     response.headers.add("Access-Control-Allow-Headers", "Content-Type,Authorization,Accept")
     response.headers.add("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
     response.headers.add("Access-Control-Max-Age", "3600")
     return response, 204
+
 
 # ==========================================
 # 🧠 AI-POWERED KPI TYPE INFERENCE
@@ -818,4 +819,5 @@ def get_results():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
