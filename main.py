@@ -368,9 +368,14 @@ def setup_account():
 # ==========================================
 @app.route("/create-folder", methods=["POST", "OPTIONS"])
 def create_folder():
-    
+
+    # ✅ Allow CORS preflight without auth
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
+
     uid = get_user_id(request)
-    if not uid: return jsonify({"error": "Unauthorized"}), 401
+    if not uid:
+        return jsonify({"error": "Unauthorized"}), 401
     
     try:
         payload = request.get_json()
@@ -394,9 +399,19 @@ def create_folder():
             "owner": uid,
             "shared_with": {}
         }
-        db.collection("tenants").document(uid).collection("folders").document(folder_id).set(folder_data)
 
-        return jsonify({"status": "success", "folder_id": folder_id, "folder": folder_data}), 200
+        db.collection("tenants") \
+          .document(uid) \
+          .collection("folders") \
+          .document(folder_id) \
+          .set(folder_data)
+
+        return jsonify({
+            "status": "success",
+            "folder_id": folder_id,
+            "folder": folder_data
+        }), 200
+
     except Exception as e:
         print(f"❌ Create Folder Error: {e}")
         return jsonify({"error": str(e)}), 500
@@ -1020,5 +1035,6 @@ def get_results():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
