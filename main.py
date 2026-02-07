@@ -647,8 +647,9 @@ def upload_batch_file():
 # ==========================================
 @app.route("/", methods=["POST", "OPTIONS"])
 def gcs_trigger_handler():
-    if request.method == "OPTIONS": return _build_cors_preflight_response()
-    
+    if request.method == "OPTIONS":
+        return _build_cors_preflight_response()
+
     payload = request.get_json(silent=True) or {}
     data = payload.get("data", payload)
     file_path = data.get("name", "")
@@ -659,7 +660,7 @@ def gcs_trigger_handler():
     parts = file_path.split("/")
     if len(parts) < 5 or parts[0] != "incoming" or parts[3] != "batch":
         return jsonify({"status": "ignored_path"}), 200
-    
+
     uid = parts[1]
     folder_id = parts[2]
 
@@ -667,89 +668,117 @@ def gcs_trigger_handler():
         folder_ref = db.collection("tenants").document(uid).collection("folders").document(folder_id).get()
         if not folder_ref.exists:
             return jsonify({"error": "Folder not trained"}), 200
-            
+
         folder_data = folder_ref.to_dict()
         kpis = folder_data.get("selected_kpis", [])
         kpi_metadata = folder_data.get("kpi_metadata", [])
         context_hint = folder_data.get("context_hint", "")
 
-        # Build type lookup from metadata
-        kpi_type_lookup = {}
-        for kpi in kpi_metadata:
-            kpi_type_lookup[kpi.get("name", "")] = kpi.get("type", "string")
+        # Build KPI type lookup
+        kpi_type_lookup = {
+            kpi.get("name", ""): kpi.get("type", "string")
+            for kpi in kpi_metadata
+        }
 
         storage_client = storage.Client()
-        source_bucket = storage_client.bucket(BUCKET_NAME)
-        blob = source_bucket.blob(file_path)
+        bucket = storage_client.bucket(BUCKET_NAME)
+        blob = bucket.blob(file_path)
         pdf_bytes = blob.download_as_bytes()
 
         prompt = f"""
-        Extract the values for these specific keys: {kpis}. 
-        CONTEXT: {context_hint if context_hint else "Generic data extraction."}
-        Return ONLY a JSON object. If a value is missing, return "N/A".
-        """
-        
+You are a document data extraction engine for business PDFs.
+
+CRITICAL INSTRUCTIONS:
+
+1. If the document contains ONE OR MORE TABLES:
+   - Treat tables like database tables (columns + rows).
+   - Preserve row integrity.
+   - If multiple rows exist, return MULTIPLE records.
+   - Do NOT merge rows.
+   - Empty cells must be "N/A".
+
+2. If the document DOES NOT contain tables:
+   - Read like a human.
+   - Link related values correctly.
+   - Do NOT guess.
+
+3. ONLY extract these fields:
+   {kpis}
+
+4. OUTPUT:
+   - VALID JSON only
+   - Array if multiple rows
+   - Object if single row
+   - Missing values = "N/A"
+
+5. CONTEXT:
+   {context_hint or "Generic business document"}
+"""
+
         resp = client.models.generate_content(
             model="gemini-2.0-flash-001",
-            contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
+            contents=[
+                types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
+                prompt
+            ],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 temperature=0.0
             ),
         )
-        
-        raw_extract = resp.text.strip()
-        if raw_extract.startswith("```"):
-            raw_extract = re.sub(r'^```json\s*|```$', '', raw_extract, flags=re.MULTILINE)
-        
-        extracted_data = json.loads(raw_extract)
-        if isinstance(extracted_data, list):
-            extracted_data = extracted_data[0]
+
+        raw = resp.text.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r'^```json\s*|```$', '', raw, flags=re.MULTILINE)
+
+        extracted_data = json.loads(raw)
+
+        # ✅ Normalize to list
+        records = extracted_data if isinstance(extracted_data, list) else [extracted_data]
 
         owner_uid = folder_data.get("owner", uid)
-        
-        # Use typed schema sync if metadata exists
+
+        # Ensure table exists
         if kpi_metadata:
             table_id, _ = sync_bigquery_schema_typed(owner_uid, folder_id, kpi_metadata)
         else:
             table_id = sync_bigquery_schema(owner_uid, folder_id, kpis)
-        
-        # Build row with properly typed values
-        row = {
-            "row_id": f"row_{int(time.time())}",
-            "file_name": file_path.split("/")[-1],
-            "uploaded_at": datetime.datetime.utcnow().isoformat()
-        }
-        
-        for k in kpis:
-            safe_col_name = f"kpi_{re.sub(r'[^a-zA-Z0-9_]', '_', k).lower()}"
-            raw_value = extracted_data.get(k, "N/A")
-            kpi_type = kpi_type_lookup.get(k, "string")
-            
-            # Convert value to proper type for BigQuery
-            typed_value = convert_value_for_bq(raw_value, kpi_type)
-            row[safe_col_name] = typed_value
-            
-            print(f"📊 {k}: '{raw_value}' -> {typed_value} ({kpi_type})")
+
+        rows_to_insert = []
+
+        for idx, record in enumerate(records):
+            row = {
+                "row_id": f"row_{int(time.time() * 1000)}_{idx}",
+                "file_name": file_path.split("/")[-1],
+                "uploaded_at": datetime.datetime.utcnow().isoformat()
+            }
+
+            for k in kpis:
+                col = f"kpi_{re.sub(r'[^a-zA-Z0-9_]', '_', k).lower()}"
+                raw_val = record.get(k, "N/A")
+                row[col] = convert_value_for_bq(raw_val, kpi_type_lookup.get(k, "string"))
+
+            rows_to_insert.append(row)
 
         bq_client = bigquery.Client()
-        errors = bq_client.insert_rows_json(table_id, [row])
-        
-        if errors:
-            print(f"❌ BigQuery Insert Errors: {errors}")
-            return jsonify({"error": "BigQuery Insert Failed", "details": str(errors)}), 200
+        errors = bq_client.insert_rows_json(table_id, rows_to_insert)
 
+        if errors:
+            print("❌ BigQuery insert errors:", errors)
+            return jsonify({"error": "BigQuery insert failed", "details": errors}), 200
+
+        # Move file to processed
         new_path = file_path.replace("incoming/", "processed/")
-        source_bucket.copy_blob(blob, source_bucket, new_path)
+        bucket.copy_blob(blob, bucket, new_path)
         blob.delete()
 
-        print(f"✅ Successfully processed {file_path} with typed values")
-        return jsonify({"status": "success"}), 200
+        print(f"✅ Processed {file_path} → {len(rows_to_insert)} rows inserted")
+        return jsonify({"status": "success", "rows": len(rows_to_insert)}), 200
 
     except Exception as e:
-        print(f"❌ Batch Engine Error: {str(e)}")
+        print(f"❌ Batch Engine Error: {e}")
         return jsonify({"error": str(e)}), 200
-
+   
 # ==========================================
 # 📈 8. FETCH RESULTS API
 # ==========================================
@@ -809,5 +838,6 @@ def get_results():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
