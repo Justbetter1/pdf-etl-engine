@@ -888,28 +888,32 @@ def gcs_trigger_handler():
                     "confidence": similarity.get("confidence", 0)
                 }), 200
 
-        # ------------------------------------------
-        # 📤 KPI extraction prompt
-        # ------------------------------------------
-        prompt = f"""
+ # ------------------------------------------
+# 📤 KPI extraction prompt (FIXED)
+# ------------------------------------------
+kpi_list = "\n".join([f"- {k}" for k in kpis])
+
+prompt = f"""
 You are a professional document data extraction engine.
 
-Extract values for the following fields:
-{kpis}
+Extract values for ALL of the following fields:
+{kpi_list}
 
 DOCUMENT CONTEXT:
-{context_hint}
+{context_hint if context_hint else "Generic business document"}
 
-RULES:
-- Detect STRUCTURED vs UNSTRUCTURED documents
-- Structured → tables = rows & columns
-- Unstructured → infer by semantic meaning
-- NEVER guess or hallucinate
-- Missing values → "N/A"
+RULES (STRICT):
+- You MUST return ALL listed fields
+- Use the exact field names as provided
+- If a value is missing or unclear, return "N/A"
+- Do NOT merge fields
+- Do NOT drop fields
+- Do NOT guess or hallucinate
 
 Return ONLY valid JSON:
 {{ "field_name": "value" }}
 """
+
 
         # ------------------------------------------
         # 🤖 Call Gemini
@@ -998,9 +1002,15 @@ Return ONLY valid JSON:
 # ==========================================
 @app.route("/get-results", methods=["GET", "OPTIONS"])
 def get_results():
+
+    # ✅ Allow CORS preflight without auth
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
     
     uid = get_user_id(request)
-    if not uid: return jsonify({"error": "Unauthorized"}), 401
+    if not uid:
+        return jsonify({"error": "Unauthorized"}), 401
+
     
     folder_id = request.args.get("folder_id")
     owner_id = request.args.get("owner_id")
@@ -1052,6 +1062,7 @@ def get_results():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
 
