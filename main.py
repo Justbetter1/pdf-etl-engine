@@ -534,25 +534,7 @@ def get_kpis():
             return jsonify({"error": "Folder not found"}), 404
             
         folder_data = folder_ref.to_dict()
-        
-        # ---- PERMISSION CHECK ----
-is_owner = (uid == owner_id)
-
-if not is_owner:
-    sanitized_email = re.sub(r'[@.]', '_', user_email)
-    share_doc_id = f"{owner_id}_{folder_id}_{sanitized_email}"
-    share_ref = db.collection("shares").document(share_doc_id).get()
-
-    if not share_ref.exists:
-        return jsonify({"error": "Share not found. You do not have access to this folder."}), 403
-
-    share_data = share_ref.to_dict()
-    permission = share_data.get("permission", "view")
-
-    if permission != "edit":
-        return jsonify({"error": "You have view-only access. Upload not permitted."}), 403
-
-        
+     
         # Return pre-computed metadata if available (from AI inference)
         kpi_metadata = folder_data.get("kpi_metadata")
         
@@ -597,7 +579,7 @@ if not is_owner:
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 📤 6. UPLOAD BATCH FILE (for shared users)
+# 📤 6. UPLOAD BATCH FILE (owners + shared users)
 # ==========================================
 @app.route("/upload-batch-file", methods=["POST", "OPTIONS"])
 def upload_batch_file():
@@ -620,19 +602,22 @@ def upload_batch_file():
         if not file.filename.lower().endswith('.pdf'):
             return jsonify({"error": "Only PDF files are allowed"}), 400
 
-        sanitized_email = re.sub(r'[@.]', '_', user_email)
-        share_doc_id = f"{owner_id}_{folder_id}_{sanitized_email}"
+        # ---- PERMISSION CHECK ----
+        is_owner = (uid == owner_id)
 
-        share_ref = db.collection("shares").document(share_doc_id).get()
+        if not is_owner:
+            sanitized_email = re.sub(r'[@.]', '_', user_email)
+            share_doc_id = f"{owner_id}_{folder_id}_{sanitized_email}"
+            share_ref = db.collection("shares").document(share_doc_id).get()
 
-        if not share_ref.exists:
-            return jsonify({"error": "Share not found. You do not have access to this folder."}), 403
+            if not share_ref.exists:
+                return jsonify({"error": "Share not found. You do not have access to this folder."}), 403
 
-        share_data = share_ref.to_dict()
-        permission = share_data.get("permission", "view")
+            share_data = share_ref.to_dict()
+            permission = share_data.get("permission", "view")
 
-        if permission != "edit":
-            return jsonify({"error": "You have view-only access. Upload not permitted."}), 403
+            if permission != "edit":
+                return jsonify({"error": "You have view-only access. Upload not permitted."}), 403
 
         original_filename = file.filename or "unnamed.pdf"
         sanitized_filename = re.sub(r'[^a-zA-Z0-9_.-]', '_', original_filename)
@@ -644,7 +629,8 @@ def upload_batch_file():
         
         blob.upload_from_file(file, content_type="application/pdf")
 
-        print(f"✅ Shared user {user_email} uploaded {sanitized_filename} to {storage_path}")
+        who = "Owner" if is_owner else f"Shared user {user_email}"
+        print(f"✅ {who} uploaded {sanitized_filename} to {storage_path}")
 
         return jsonify({
             "success": True,
@@ -823,4 +809,5 @@ def get_results():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
