@@ -535,17 +535,23 @@ def get_kpis():
             
         folder_data = folder_ref.to_dict()
         
-        # Permission check
-        is_owner = uid == folder_data.get("owner")
-        has_share = uid in folder_data.get("shared_with", {})
-        
-        if not is_owner and not has_share:
-            shares_query = db.collection("shares").where("folderId", "==", folder_id).where("ownerId", "==", target_uid).get()
-            if len(list(shares_query)) > 0:
-                has_share = True
-        
-        if not is_owner and not has_share:
-            return jsonify({"error": "Access denied"}), 403
+        # ---- PERMISSION CHECK ----
+is_owner = (uid == owner_id)
+
+if not is_owner:
+    sanitized_email = re.sub(r'[@.]', '_', user_email)
+    share_doc_id = f"{owner_id}_{folder_id}_{sanitized_email}"
+    share_ref = db.collection("shares").document(share_doc_id).get()
+
+    if not share_ref.exists:
+        return jsonify({"error": "Share not found. You do not have access to this folder."}), 403
+
+    share_data = share_ref.to_dict()
+    permission = share_data.get("permission", "view")
+
+    if permission != "edit":
+        return jsonify({"error": "You have view-only access. Upload not permitted."}), 403
+
         
         # Return pre-computed metadata if available (from AI inference)
         kpi_metadata = folder_data.get("kpi_metadata")
@@ -817,3 +823,4 @@ def get_results():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
