@@ -647,7 +647,8 @@ def get_kpis():
 # ==========================================
 @app.route("/upload-batch-file", methods=["POST", "OPTIONS"])
 def upload_batch_file():
-    if request.method == "OPTIONS": return _build_cors_preflight_response()
+    if request.method == "OPTIONS":
+        return _build_cors_preflight_response()
     
     uid = get_user_id(request)
     user_email = get_user_email(request)
@@ -661,76 +662,66 @@ def upload_batch_file():
         file = request.files.get("file")
 
         if not folder_id or not owner_id or not file:
-            return jsonify({"error": "Missing required fields: folder_id, owner_id, or file"}), 400
+            return jsonify({"error": "Missing required fields"}), 400
 
-        if not file.filename.lower().endswith('.pdf'):
-            return jsonify({"error": "Only PDF files are allowed"}), 400
+        if not file.filename.lower().endswith(".pdf"):
+            return jsonify({"error": "Only PDF files allowed"}), 400
 
         # ---- PERMISSION CHECK ----
         is_owner = (uid == owner_id)
 
         if not is_owner:
             sanitized_email = re.sub(r'[@.]', '_', user_email)
-            share_doc_id = f"{owner_id}_{folder_id}_{sanitized_email}"
-            share_ref = db.collection("shares").document(share_doc_id).get()
+            share_id = f"{owner_id}_{folder_id}_{sanitized_email}"
+            share_ref = db.collection("shares").document(share_id).get()
 
             if not share_ref.exists:
-                return jsonify({"error": "Share not found. You do not have access to this folder."}), 403
+                return jsonify({"error": "No access"}), 403
 
-            share_data = share_ref.to_dict()
-            permission = share_data.get("permission", "view")
+            if share_ref.to_dict().get("permission") != "edit":
+                return jsonify({"error": "Upload not permitted"}), 403
 
-            if permission != "edit":
-                return jsonify({"error": "You have view-only access. Upload not permitted."}), 403
+        sanitized_filename = re.sub(r'[^a-zA-Z0-9_.-]', '_', file.filename)
 
-        original_filename = file.filename or "unnamed.pdf"
-        sanitized_filename = re.sub(r'[^a-zA-Z0-9_.-]', '_', original_filename)
-
-          # ---- SEMANTIC VALIDATION ----
-folder_ref = (
-    db.collection("tenants")
-    .document(owner_id)
-    .collection("folders")
-    .document(folder_id)
-    .get()
-)
-
-if folder_ref.exists:
-    folder_data = folder_ref.to_dict()
-    master_intent_profile = folder_data.get("master_intent_profile")
-    context_hint = folder_data.get("context_hint", "")
-
-    if master_intent_profile:
-        pdf_bytes = file.read()
-        file.seek(0)  # ✅ IMPORTANT: reset pointer for upload
-
-        similarity = validate_document_semantic_similarity(
-            pdf_bytes=pdf_bytes,
-            master_intent_profile=master_intent_profile,
-            context_hint=context_hint
+        # ---- SEMANTIC VALIDATION ----
+        folder_ref = (
+            db.collection("tenants")
+            .document(owner_id)
+            .collection("folders")
+            .document(folder_id)
+            .get()
         )
 
-        confidence = float(similarity.get("confidence", 0))
+        if folder_ref.exists:
+            folder_data = folder_ref.to_dict()
+            master_intent_profile = folder_data.get("master_intent_profile")
+            context_hint = folder_data.get("context_hint", "")
 
-        # ✅ LOWER-SENSITIVITY REJECTION LOGIC
-        if not similarity.get("is_similar") and confidence < 0.45:
-            return jsonify({
-                "status": "rejected",
-                "reason": similarity.get("reason"),
-                "confidence": confidence
-            }), 200
+            if master_intent_profile:
+                pdf_bytes = file.read()
+                file.seek(0)
 
+                similarity = validate_document_semantic_similarity(
+                    pdf_bytes=pdf_bytes,
+                    master_intent_profile=master_intent_profile,
+                    context_hint=context_hint
+                )
 
-        # ---- UPLOAD TO STORAGE ----
+                confidence = float(similarity.get("confidence", 0))
+
+                # ✅ LOWER SENSITIVITY
+                if similarity.get("is_similar") is False and confidence < 0.35:
+                    return jsonify({
+                        "status": "rejected",
+                        "reason": similarity.get("reason"),
+                        "confidence": confidence
+                    }), 200
+
+        # ---- UPLOAD ----
         storage_path = f"incoming/{owner_id}/{folder_id}/batch/{sanitized_filename}"
-        storage_client = storage.Client()
-        bucket = storage_client.bucket(BUCKET_NAME)
+        bucket = storage.Client().bucket(BUCKET_NAME)
         blob = bucket.blob(storage_path)
-
         blob.upload_from_file(file, content_type="application/pdf")
-
-        who = "Owner" if is_owner else f"Shared user {user_email}"
-        print(f"✅ {who} uploaded {sanitized_filename} to {storage_path}")
 
         return jsonify({
             "success": True,
@@ -739,9 +730,8 @@ if folder_ref.exists:
         }), 200
 
     except Exception as e:
-        print(f"❌ Upload Batch File Error: {str(e)}")
+        print(f"❌ Upload Error: {e}")
         return jsonify({"error": str(e)}), 500
-
 
 # ==========================================
 # 🧠 SEMANTIC DOCUMENT SIMILARITY VALIDATOR
@@ -1033,6 +1023,7 @@ def get_results():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
 
