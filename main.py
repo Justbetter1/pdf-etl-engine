@@ -421,55 +421,72 @@ def create_folder():
 # ==========================================
 @app.route("/analyze-master", methods=["POST", "OPTIONS"])
 def analyze_master():
-    
+
+    # ✅ Allow CORS preflight without auth
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
+
     uid = get_user_id(request)
-    if not uid: return jsonify({"error": "Unauthorized"}), 401
-    
-    payload = request.get_json()
-    file_path = payload.get("file_path") 
+    if not uid:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    payload = request.get_json() or {}
+    file_path = payload.get("file_path")
     context_hint = payload.get("context_hint", "")
-    
-    print(f"🔍 LOG: Analyzing master with context: {context_hint}")
+
+    if not file_path:
+        return jsonify({"error": "file_path is required"}), 400
 
     try:
         storage_client = storage.Client()
         bucket = storage_client.bucket(BUCKET_NAME)
         blob = bucket.blob(file_path)
-        
+
         if not blob.exists():
             return jsonify({"error": f"File {file_path} not found"}), 404
 
         pdf_bytes = blob.download_as_bytes()
 
         prompt = f"""
-        Extract all data labels and headers found in this document. 
-        USER CONTEXT: {context_hint if context_hint else "Generic business document."}
-        Return ONLY a valid JSON object of {{field_name: example_value}}. 
-        Ensure keys are descriptive and relevant to the provided USER CONTEXT.
-        """
-        
+Extract all data labels and headers found in this document.
+USER CONTEXT: {context_hint if context_hint else "Generic business document."}
+
+Return ONLY valid JSON:
+{{"field_name": "example_value"}}
+"""
+
         resp = client.models.generate_content(
             model="gemini-2.0-flash-001",
-            contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
+            contents=[
+                types.Part.from_bytes(
+                    data=pdf_bytes,
+                    mime_type="application/pdf"
+                ),
+                prompt
+            ],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 temperature=0.0
             ),
         )
-        
-        raw_text = resp.text.strip()
-        if raw_text.startswith("```"):
-            raw_text = re.sub(r'^```json\s*|```$', '', raw_text, flags=re.MULTILINE)
-        
-        detected_dict = json.loads(raw_text)
-        if isinstance(detected_dict, list):
-            detected_dict = detected_dict[0] if len(detected_dict) > 0 else {}
-        
-        formatted_kpis = [{"key": k, "value": str(v)} for k, v in detected_dict.items()]
-        
+
+        raw = (resp.text or "").strip()
+        if raw.startswith("```"):
+            raw = re.sub(r'^```json\s*|```$', '', raw, flags=re.MULTILINE)
+
+        detected = json.loads(raw)
+        if isinstance(detected, list):
+            detected = detected[0] if detected else {}
+
+        formatted_kpis = [
+            {"key": k, "value": str(v)}
+            for k, v in detected.items()
+        ]
+
         return jsonify({"detected_kpis": formatted_kpis}), 200
+
     except Exception as e:
-        print(f"❌ Analyze Master Crash: {str(e)}")
+        print(f"❌ Analyze Master Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
@@ -1035,6 +1052,7 @@ def get_results():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
 
