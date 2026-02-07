@@ -686,39 +686,40 @@ def upload_batch_file():
         original_filename = file.filename or "unnamed.pdf"
         sanitized_filename = re.sub(r'[^a-zA-Z0-9_.-]', '_', original_filename)
 
-        # ---- SEMANTIC VALIDATION ----
-        folder_ref = (
-            db.collection("tenants")
-            .document(owner_id)
-            .collection("folders")
-            .document(folder_id)
-            .get()
+          # ---- SEMANTIC VALIDATION ----
+folder_ref = (
+    db.collection("tenants")
+    .document(owner_id)
+    .collection("folders")
+    .document(folder_id)
+    .get()
+)
+
+if folder_ref.exists:
+    folder_data = folder_ref.to_dict()
+    master_intent_profile = folder_data.get("master_intent_profile")
+    context_hint = folder_data.get("context_hint", "")
+
+    if master_intent_profile:
+        pdf_bytes = file.read()
+        file.seek(0)  # ✅ IMPORTANT: reset pointer for upload
+
+        similarity = validate_document_semantic_similarity(
+            pdf_bytes=pdf_bytes,
+            master_intent_profile=master_intent_profile,
+            context_hint=context_hint
         )
 
-        if folder_ref.exists:
-            folder_data = folder_ref.to_dict()
-            master_intent_profile = folder_data.get("master_intent_profile")
-            context_hint = folder_data.get("context_hint", "")
+        confidence = float(similarity.get("confidence", 0))
 
-            if master_intent_profile:
-                pdf_bytes = file.read()
-                file.seek(0)  # Reset pointer for upload
+        # ✅ LOWER-SENSITIVITY REJECTION LOGIC
+        if not similarity.get("is_similar") and confidence < 0.45:
+            return jsonify({
+                "status": "rejected",
+                "reason": similarity.get("reason"),
+                "confidence": confidence
+            }), 200
 
-                similarity = validate_document_semantic_similarity(
-                    pdf_bytes=pdf_bytes,
-                    master_intent_profile=master_intent_profile,
-                    context_hint=context_hint
-                )
-
-                if (
-                    not similarity.get("is_similar")
-                    or similarity.get("confidence", 0) < 0.70
-                ):
-                    return jsonify({
-                        "status": "rejected",
-                        "reason": similarity.get("reason"),
-                        "confidence": similarity.get("confidence", 0)
-                    }), 200
 
         # ---- UPLOAD TO STORAGE ----
         storage_path = f"incoming/{owner_id}/{folder_id}/batch/{sanitized_filename}"
@@ -770,10 +771,12 @@ USER CONTEXT:
 {context_hint if context_hint else "Generic business documents"}
 
 RULES:
-- Compare by meaning and business intent
-- Ignore layout, formatting, templates
-- Same meaning = VALID
-- Different meaning = INVALID
+- Compare by overall business purpose and document intent
+- Minor wording differences, formatting changes, or reordered fields are ACCEPTABLE
+- Same business process = VALID
+- Only reject if the document represents a DIFFERENT business workflow
+- If unsure, prefer VALID
+
 
 Return ONLY valid JSON:
 {{
@@ -1030,6 +1033,7 @@ def get_results():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
 
