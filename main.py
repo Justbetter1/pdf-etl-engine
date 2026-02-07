@@ -473,35 +473,53 @@ def confirm_kpis():
     if not uid: return jsonify({"error": "Unauthorized"}), 401
     
     try:
-        payload = request.get_json()
-        folder_id = payload.get("folder_id")
-        selected_kpis = payload.get("selected_kpis")
-        kpi_samples = payload.get("kpi_samples", {})
+    payload = request.get_json()
+    folder_id = payload.get("folder_id")
+    selected_kpis = payload.get("selected_kpis")
+    kpi_samples = payload.get("kpi_samples", {})
 
-        # 🧠 Use AI to infer types for all KPIs at once
-        print(f"🧠 Calling Gemini AI to analyze {len(kpi_samples)} KPIs...")
-        kpi_types = infer_kpi_types_with_ai(kpi_samples)
+    # 🧠 Use AI to infer types for all KPIs at once
+    print(f"🧠 Calling Gemini AI to analyze {len(kpi_samples)} KPIs...")
+    kpi_types = infer_kpi_types_with_ai(kpi_samples)
+
+    # Build KPI metadata with normalization
+    kpi_metadata = []
+
+    for kpi_name in selected_kpis:
+        normalized_name = re.sub(r"_\d+$", "", kpi_name)
+        sample_value = kpi_samples.get(kpi_name, "")
+        inferred_type = kpi_types.get(
+            kpi_name,
+            infer_kpi_type_fallback(sample_value)
+        )
+
+        kpi_metadata.append({
+            "name": normalized_name,
+            "sample_value": sample_value,
+            "type": inferred_type
+        })
+
+    # Deduplicate KPIs by normalized name
+    unique = {}
+    for k in kpi_metadata:
+        unique[k["name"]] = k
+
+    kpi_metadata = list(unique.values())
+
+
+
         
-        # Build the full KPI metadata with types
-        kpi_metadata = []
-        for kpi_name in selected_kpis:
-            sample_value = kpi_samples.get(kpi_name, "")
-            inferred_type = kpi_types.get(kpi_name, infer_kpi_type_fallback(sample_value))
-            kpi_metadata.append({
-                "name": kpi_name,
-                "sample_value": sample_value,
-                "type": inferred_type
-            })
+
 
         # Store everything in Firestore
         db.collection("tenants").document(uid).collection("folders").document(folder_id).update({
-            "selected_kpis": selected_kpis,
+            "selected_kpis": list({re.sub(r"_\d+$", "", k) for k in selected_kpis}),
             "kpi_samples": kpi_samples,
             "kpi_metadata": kpi_metadata,
             "is_trained": True,
             "status": "active"
         })
-        
+      
         # 📊 Create BigQuery table with TYPED schema
         sync_bigquery_schema_typed(uid, folder_id, kpi_metadata)
         
@@ -748,14 +766,15 @@ CRITICAL INSTRUCTIONS:
 
         for idx, record in enumerate(records):
             row = {
-                "row_id": f"row_{int(time.time() * 1000)}_{idx}",
-                "file_name": file_path.split("/")[-1],
-                "uploaded_at": datetime.datetime.utcnow().isoformat()
-            }
+    "document_id": file_path,
+    "row_index": idx,
+    "uploaded_at": datetime.datetime.utcnow().isoformat()
+}
+
 
             for k in kpis:
                 col = f"kpi_{re.sub(r'[^a-zA-Z0-9_]', '_', k).lower()}"
-                raw_val = record.get(k, "N/A")
+                raw_val = record.get(k) or record.get(k.lower()) or "N/A"
                 row[col] = convert_value_for_bq(raw_val, kpi_type_lookup.get(k, "string"))
 
             rows_to_insert.append(row)
@@ -838,6 +857,7 @@ def get_results():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
 
