@@ -875,33 +875,7 @@ def gcs_trigger_handler():
         blob = bucket.blob(file_path)
         pdf_bytes = blob.download_as_bytes()
 
-        # --------------------------------------------------
-        # 🧠 SEMANTIC SIMILARITY CHECK (BATCH ONLY)
-        # --------------------------------------------------
-        if master_intent_profile:
-            similarity = validate_document_semantic_similarity(
-                pdf_bytes=pdf_bytes,
-                master_intent_profile=master_intent_profile,
-                context_hint=context_hint
-            )
-
-            if (
-                not similarity.get("is_similar")
-                or similarity.get("confidence", 0) < 0.70
-            ):
-                rejected_path = file_path.replace("incoming/", "rejected/")
-
-                bucket.copy_blob(blob, bucket, rejected_path)
-                blob.delete()
-
-                print(f"🚫 Rejected PDF moved to {rejected_path}")
-
-                return jsonify({
-                    "status": "rejected",
-                    "reason": similarity.get("reason"),
-                    "confidence": similarity.get("confidence", 0),
-                    "path": rejected_path
-                }), 200
+    
 
         # --------------------------------------------------
         # 🧠 EXTRACTION PROMPT (TABLE + TEXT AWARE)
@@ -1056,5 +1030,6 @@ def get_results():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
