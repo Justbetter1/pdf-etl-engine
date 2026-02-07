@@ -5,7 +5,7 @@ import time
 import json
 import firebase_admin
 from firebase_admin import auth, firestore
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 from google.cloud import storage, bigquery
 from google import genai
@@ -368,14 +368,9 @@ def setup_account():
 # ==========================================
 @app.route("/create-folder", methods=["POST", "OPTIONS"])
 def create_folder():
-
-    # ✅ Allow CORS preflight without auth
-    if request.method == "OPTIONS":
-        return jsonify({}), 200
-
+    
     uid = get_user_id(request)
-    if not uid:
-        return jsonify({"error": "Unauthorized"}), 401
+    if not uid: return jsonify({"error": "Unauthorized"}), 401
     
     try:
         payload = request.get_json()
@@ -399,19 +394,9 @@ def create_folder():
             "owner": uid,
             "shared_with": {}
         }
+        db.collection("tenants").document(uid).collection("folders").document(folder_id).set(folder_data)
 
-        db.collection("tenants") \
-          .document(uid) \
-          .collection("folders") \
-          .document(folder_id) \
-          .set(folder_data)
-
-        return jsonify({
-            "status": "success",
-            "folder_id": folder_id,
-            "folder": folder_data
-        }), 200
-
+        return jsonify({"status": "success", "folder_id": folder_id, "folder": folder_data}), 200
     except Exception as e:
         print(f"❌ Create Folder Error: {e}")
         return jsonify({"error": str(e)}), 500
@@ -421,93 +406,71 @@ def create_folder():
 # ==========================================
 @app.route("/analyze-master", methods=["POST", "OPTIONS"])
 def analyze_master():
-
-    # ✅ Allow CORS preflight without auth
-    if request.method == "OPTIONS":
-        return jsonify({}), 200
-
+    
     uid = get_user_id(request)
-    if not uid:
-        return jsonify({"error": "Unauthorized"}), 401
-
-    payload = request.get_json() or {}
-    file_path = payload.get("file_path")
+    if not uid: return jsonify({"error": "Unauthorized"}), 401
+    
+    payload = request.get_json()
+    file_path = payload.get("file_path") 
     context_hint = payload.get("context_hint", "")
-
-    if not file_path:
-        return jsonify({"error": "file_path is required"}), 400
+    
+    print(f"🔍 LOG: Analyzing master with context: {context_hint}")
 
     try:
         storage_client = storage.Client()
         bucket = storage_client.bucket(BUCKET_NAME)
         blob = bucket.blob(file_path)
-
+        
         if not blob.exists():
             return jsonify({"error": f"File {file_path} not found"}), 404
 
         pdf_bytes = blob.download_as_bytes()
 
         prompt = f"""
-Extract all data labels and headers found in this document.
-USER CONTEXT: {context_hint if context_hint else "Generic business document."}
-
-Return ONLY valid JSON:
-{{"field_name": "example_value"}}
-"""
-
+        Extract all data labels and headers found in this document. 
+        USER CONTEXT: {context_hint if context_hint else "Generic business document."}
+        Return ONLY a valid JSON object of {{field_name: example_value}}. 
+        Ensure keys are descriptive and relevant to the provided USER CONTEXT.
+        """
+        
         resp = client.models.generate_content(
             model="gemini-2.0-flash-001",
-            contents=[
-                types.Part.from_bytes(
-                    data=pdf_bytes,
-                    mime_type="application/pdf"
-                ),
-                prompt
-            ],
+            contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 temperature=0.0
             ),
         )
-
-        raw = (resp.text or "").strip()
-        if raw.startswith("```"):
-            raw = re.sub(r'^```json\s*|```$', '', raw, flags=re.MULTILINE)
-
-        detected = json.loads(raw)
-        if isinstance(detected, list):
-            detected = detected[0] if detected else {}
-
-        formatted_kpis = [
-            {"key": k, "value": str(v)}
-            for k, v in detected.items()
-        ]
-
+        
+        raw_text = resp.text.strip()
+        if raw_text.startswith("```"):
+            raw_text = re.sub(r'^```json\s*|```$', '', raw_text, flags=re.MULTILINE)
+        
+        detected_dict = json.loads(raw_text)
+        if isinstance(detected_dict, list):
+            detected_dict = detected_dict[0] if len(detected_dict) > 0 else {}
+        
+        formatted_kpis = [{"key": k, "value": str(v)} for k, v in detected_dict.items()]
+        
         return jsonify({"detected_kpis": formatted_kpis}), 200
-
     except Exception as e:
-        print(f"❌ Analyze Master Error: {e}")
+        print(f"❌ Analyze Master Crash: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
 # ✅ 4. CONFIRM SELECTED KPIs (WITH AI TYPE INFERENCE + TYPED SCHEMA)
 # ==========================================
-
 @app.route("/confirm-kpis", methods=["POST", "OPTIONS"])
 def confirm_kpis():
     
     uid = get_user_id(request)
-    if not uid:
-        return jsonify({"error": "Unauthorized"}), 401
+    if not uid: return jsonify({"error": "Unauthorized"}), 401
     
     try:
         payload = request.get_json()
         folder_id = payload.get("folder_id")
-        selected_kpis = payload.get("selected_kpis", [])
+        selected_kpis = payload.get("selected_kpis")
         kpi_samples = payload.get("kpi_samples", {})
-
-        if not folder_id or not selected_kpis:
-            return jsonify({"error": "folder_id and selected_kpis are required"}), 400
 
         # 🧠 Use AI to infer types for all KPIs at once
         print(f"🧠 Calling Gemini AI to analyze {len(kpi_samples)} KPIs...")
@@ -517,45 +480,18 @@ def confirm_kpis():
         kpi_metadata = []
         for kpi_name in selected_kpis:
             sample_value = kpi_samples.get(kpi_name, "")
-            inferred_type = kpi_types.get(
-                kpi_name,
-                infer_kpi_type_fallback(sample_value)
-            )
+            inferred_type = kpi_types.get(kpi_name, infer_kpi_type_fallback(sample_value))
             kpi_metadata.append({
                 "name": kpi_name,
                 "sample_value": sample_value,
                 "type": inferred_type
             })
 
-        # 🔎 Load folder context (needed for semantic intent)
-        folder_ref = (
-            db.collection("tenants")
-            .document(uid)
-            .collection("folders")
-            .document(folder_id)
-            .get()
-        )
-
-        if not folder_ref.exists:
-            return jsonify({"error": "Folder not found"}), 404
-
-        folder_data = folder_ref.to_dict()
-        context_hint = folder_data.get("context_hint", "")
-
-        # 🧠 Build MASTER INTENT PROFILE (semantic only)
-        master_intent_profile = {
-            "document_category": folder_id,          # invoices, shipments, etc.
-            "business_purpose": context_hint,
-            "kpis": selected_kpis,
-            "example_terms": selected_kpis[:5]       # lightweight semantic anchor
-        }
-
-        # 💾 Store everything in Firestore
+        # Store everything in Firestore
         db.collection("tenants").document(uid).collection("folders").document(folder_id).update({
             "selected_kpis": selected_kpis,
             "kpi_samples": kpi_samples,
             "kpi_metadata": kpi_metadata,
-            "master_intent_profile": master_intent_profile,
             "is_trained": True,
             "status": "active"
         })
@@ -563,17 +499,11 @@ def confirm_kpis():
         # 📊 Create BigQuery table with TYPED schema
         sync_bigquery_schema_typed(uid, folder_id, kpi_metadata)
         
-        print(f"✅ KPIs confirmed + master intent stored for folder {folder_id}")
-
-        return jsonify({
-            "status": "success",
-            "kpi_metadata": kpi_metadata
-        }), 200
-
+        print(f"✅ KPIs confirmed with AI-inferred types: {kpi_metadata}")
+        return jsonify({"status": "success", "kpi_metadata": kpi_metadata}), 200
     except Exception as e:
         print(f"❌ Confirm KPIs Error: {e}")
         return jsonify({"error": str(e)}), 500
-
 
 # ==========================================
 # 📋 5. GET KPIs (with pre-computed type metadata)
@@ -715,303 +645,121 @@ def upload_batch_file():
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 🧠 SEMANTIC DOCUMENT SIMILARITY VALIDATOR
+# 🚜 7. BATCH ENGINE (GCS TRIGGER HANDLER) - WITH TYPED INSERTION
 # ==========================================
-def validate_document_semantic_similarity(
-    pdf_bytes: bytes,
-    master_intent_profile: dict,
-    context_hint: str = ""
-) -> dict:
-    """
-    Checks whether an uploaded PDF matches the semantic intent
-    of the folder's master documents (meaning-based, not layout-based).
-    """
-
-    prompt = f"""
-You are a document classification and validation engine.
-
-Your task:
-Determine whether this document belongs to the SAME document TYPE
-as previously uploaded documents in this folder.
-
-MASTER DOCUMENT PROFILE:
-- Document category: {master_intent_profile.get("document_category")}
-- Business purpose: {master_intent_profile.get("business_purpose")}
-- Expected concepts / fields: {master_intent_profile.get("kpis")}
-- Example anchor terms: {master_intent_profile.get("example_terms")}
-
-ADDITIONAL USER CONTEXT:
-{context_hint if context_hint else "Generic business documents"}
-
-INSTRUCTIONS:
-- Compare by MEANING and PURPOSE, not layout
-- Ignore formatting, design, language differences
-- Different templates of the SAME document type are valid
-- Completely different document types are INVALID
-
-Return ONLY valid JSON in this EXACT format:
-{{
-  "is_similar": true | false,
-  "confidence": 0.0,
-  "reason": "short explanation"
-}}
-
-No markdown. No explanations outside JSON.
-"""
-
-    try:
-        resp = client.models.generate_content(
-            model="gemini-2.0-flash-001",
-            contents=[
-                types.Part.from_bytes(
-                    data=pdf_bytes,
-                    mime_type="application/pdf"
-                ),
-                prompt
-            ],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.0
-            ),
-        )
-
-        raw = (resp.text or "").strip()
-        if raw.startswith("```"):
-            raw = re.sub(r'^```json\s*|```$', '', raw, flags=re.MULTILINE)
-
-        result = json.loads(raw)
-
-        confidence_raw = result.get("confidence", 0)
-        try:
-            confidence = float(confidence_raw)
-        except Exception:
-            confidence = 0.0
-
-        return {
-            "is_similar": bool(result.get("is_similar", False)),
-            "confidence": confidence,
-            "reason": str(result.get("reason", "No reason provided"))
-        }
-
-    except Exception as e:
-        print(f"❌ Semantic validation error: {e}")
-
-        # Fail-safe: reject if validator fails
-        return {
-            "is_similar": False,
-            "confidence": 0.0,
-            "reason": "Semantic validation failed"
-        }
-
-
-# ==========================================
-
-
-# ==========================================
-# 🚜 7. BATCH ENGINE (GCS TRIGGER HANDLER)
-# WITH SEMANTIC VALIDATION + TYPED INSERTION
-# ==========================================
-@app.route("/", methods=["POST"], provide_automatic_options=False)
+@app.route("/", methods=["POST", "OPTIONS"])
 def gcs_trigger_handler():
-
+    
+    
     payload = request.get_json(silent=True) or {}
     data = payload.get("data", payload)
     file_path = data.get("name", "")
 
-    # Ignore non-relevant files
-    if (
-        "processed/" in file_path
-        or ".placeholder" in file_path
-        or not file_path.lower().endswith(".pdf")
-    ):
+    if "processed/" in file_path or ".placeholder" in file_path or not file_path.lower().endswith(".pdf"):
         return jsonify({"status": "ignored"}), 200
 
     parts = file_path.split("/")
     if len(parts) < 5 or parts[0] != "incoming" or parts[3] != "batch":
         return jsonify({"status": "ignored_path"}), 200
-
+    
     uid = parts[1]
     folder_id = parts[2]
 
     try:
-        # ------------------------------------------
-        # 📂 Load folder configuration
-        # ------------------------------------------
-        folder_ref = (
-            db.collection("tenants")
-            .document(uid)
-            .collection("folders")
-            .document(folder_id)
-            .get()
-        )
-
+        folder_ref = db.collection("tenants").document(uid).collection("folders").document(folder_id).get()
         if not folder_ref.exists:
             return jsonify({"error": "Folder not trained"}), 200
-
+            
         folder_data = folder_ref.to_dict()
         kpis = folder_data.get("selected_kpis", [])
         kpi_metadata = folder_data.get("kpi_metadata", [])
         context_hint = folder_data.get("context_hint", "")
 
-        kpi_type_lookup = {
-            kpi.get("name"): kpi.get("type", "string")
-            for kpi in kpi_metadata
-        }
+        # Build type lookup from metadata
+        kpi_type_lookup = {}
+        for kpi in kpi_metadata:
+            kpi_type_lookup[kpi.get("name", "")] = kpi.get("type", "string")
 
-        # ------------------------------------------
-        # 📥 Load PDF
-        # ------------------------------------------
         storage_client = storage.Client()
-        bucket = storage_client.bucket(BUCKET_NAME)
-        blob = bucket.blob(file_path)
+        source_bucket = storage_client.bucket(BUCKET_NAME)
+        blob = source_bucket.blob(file_path)
         pdf_bytes = blob.download_as_bytes()
 
-        # ------------------------------------------
-        # 🧠 Semantic intent validation
-        # ------------------------------------------
-        master_intent_profile = folder_data.get("master_intent_profile")
-
-        if master_intent_profile:
-            similarity = validate_document_semantic_similarity(
-                pdf_bytes=pdf_bytes,
-                master_intent_profile=master_intent_profile,
-                context_hint=context_hint
-            )
-
-            if (
-                not similarity.get("is_similar")
-                or similarity.get("confidence", 0) < 0.70
-            ):
-                return jsonify({
-                    "status": "rejected",
-                    "reason": similarity.get("reason", "Semantic mismatch"),
-                    "confidence": similarity.get("confidence", 0)
-                }), 200
-
-        # ------------------------------------------
-        # 📤 KPI extraction prompt (FIXED)
-        # ------------------------------------------
-        kpi_list = "\n".join([f"- {k}" for k in kpis])
-
         prompt = f"""
-You are a professional document data extraction engine.
-
-Extract values for ALL of the following fields:
-{kpi_list}
-
-DOCUMENT CONTEXT:
-{context_hint if context_hint else "Generic business document"}
-
-RULES (STRICT):
-- You MUST return ALL listed fields
-- Use the exact field names as provided
-- If a value is missing or unclear, return "N/A"
-- Do NOT merge fields
-- Do NOT drop fields
-- Do NOT guess or hallucinate
-
-Return ONLY valid JSON:
-{{ "field_name": "value" }}
-"""
-
-
-
-        # ------------------------------------------
-        # 🤖 Call Gemini
-        # ------------------------------------------
+        Extract the values for these specific keys: {kpis}. 
+        CONTEXT: {context_hint if context_hint else "Generic data extraction."}
+        Return ONLY a JSON object. If a value is missing, return "N/A".
+        """
+        
         resp = client.models.generate_content(
             model="gemini-2.0-flash-001",
-            contents=[
-                types.Part.from_bytes(
-                    data=pdf_bytes,
-                    mime_type="application/pdf"
-                ),
-                prompt
-            ],
+            contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 temperature=0.0
             ),
         )
-
-        raw = (resp.text or "").strip()
-        if raw.startswith("```"):
-            raw = re.sub(r'^```json\s*|```$', '', raw, flags=re.MULTILINE)
-
-        extracted_data = json.loads(raw)
-
+        
+        raw_extract = resp.text.strip()
+        if raw_extract.startswith("```"):
+            raw_extract = re.sub(r'^```json\s*|```$', '', raw_extract, flags=re.MULTILINE)
+        
+        extracted_data = json.loads(raw_extract)
         if isinstance(extracted_data, list):
-            extracted_data = extracted_data[0] if extracted_data else {}
+            extracted_data = extracted_data[0]
 
-        if not extracted_data:
-            return jsonify({
-                "status": "failed",
-                "reason": "Empty extraction result"
-            }), 200
-
-        # ------------------------------------------
-        # 📊 BigQuery schema + insert
-        # ------------------------------------------
         owner_uid = folder_data.get("owner", uid)
-
+        
+        # Use typed schema sync if metadata exists
         if kpi_metadata:
-            table_id, _ = sync_bigquery_schema_typed(
-                owner_uid, folder_id, kpi_metadata
-            )
+            table_id, _ = sync_bigquery_schema_typed(owner_uid, folder_id, kpi_metadata)
         else:
-            table_id = sync_bigquery_schema(
-                owner_uid, folder_id, kpis
-            )
-
+            table_id = sync_bigquery_schema(owner_uid, folder_id, kpis)
+        
+        # Build row with properly typed values
         row = {
             "row_id": f"row_{int(time.time())}",
             "file_name": file_path.split("/")[-1],
-            "uploaded_at": datetime.datetime.utcnow()
+            "uploaded_at": datetime.datetime.utcnow().isoformat()
         }
-
+        
         for k in kpis:
-            col = f"kpi_{re.sub(r'[^a-zA-Z0-9_]', '_', k).lower()}"
-            row[col] = convert_value_for_bq(
-                extracted_data.get(k, "N/A"),
-                kpi_type_lookup.get(k, "string")
-            )
+            safe_col_name = f"kpi_{re.sub(r'[^a-zA-Z0-9_]', '_', k).lower()}"
+            raw_value = extracted_data.get(k, "N/A")
+            kpi_type = kpi_type_lookup.get(k, "string")
+            
+            # Convert value to proper type for BigQuery
+            typed_value = convert_value_for_bq(raw_value, kpi_type)
+            row[safe_col_name] = typed_value
+            
+            print(f"📊 {k}: '{raw_value}' -> {typed_value} ({kpi_type})")
 
         bq_client = bigquery.Client()
         errors = bq_client.insert_rows_json(table_id, [row])
-
+        
         if errors:
-            return jsonify({"error": str(errors)}), 200
+            print(f"❌ BigQuery Insert Errors: {errors}")
+            return jsonify({"error": "BigQuery Insert Failed", "details": str(errors)}), 200
 
-        # ------------------------------------------
-        # 📦 Move file to processed
-        # ------------------------------------------
         new_path = file_path.replace("incoming/", "processed/")
-        bucket.copy_blob(blob, bucket, new_path)
+        source_bucket.copy_blob(blob, source_bucket, new_path)
         blob.delete()
 
+        print(f"✅ Successfully processed {file_path} with typed values")
         return jsonify({"status": "success"}), 200
 
     except Exception as e:
-        print(f"❌ Batch Engine Error: {e}")
+        print(f"❌ Batch Engine Error: {str(e)}")
         return jsonify({"error": str(e)}), 200
-
-
-
 
 # ==========================================
 # 📈 8. FETCH RESULTS API
 # ==========================================
 @app.route("/get-results", methods=["GET", "OPTIONS"])
 def get_results():
-
-    # ✅ Allow CORS preflight without auth
-    if request.method == "OPTIONS":
-        return jsonify({}), 200
     
     uid = get_user_id(request)
-    if not uid:
-        return jsonify({"error": "Unauthorized"}), 401
-
+    if not uid: return jsonify({"error": "Unauthorized"}), 401
     
     folder_id = request.args.get("folder_id")
     owner_id = request.args.get("owner_id")
@@ -1063,9 +811,5 @@ def get_results():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
-
-
-
-
 
 
