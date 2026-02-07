@@ -32,7 +32,6 @@ CORS(
     supports_credentials=True
 )
 
-
 # 3. Configuration
 PROJECT_ID = "pdf-etl-479411"
 DATASET = "etl_reports"
@@ -77,6 +76,13 @@ def get_user_email(req):
         print(f"❌ Auth Error: {e}")
         return None
 
+def _build_cors_preflight_response():
+    response = make_response()
+    response.headers.add("Access-Control-Allow-Origin", "*")
+    response.headers.add("Access-Control-Allow-Headers", "Content-Type,Authorization,Accept")
+    response.headers.add("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+    response.headers.add("Access-Control-Max-Age", "3600")
+    return response, 204
 
 # ==========================================
 # 🧠 AI-POWERED KPI TYPE INFERENCE
@@ -349,7 +355,7 @@ def sync_bigquery_schema(uid, folder_id, kpi_list):
 # ==========================================
 @app.route("/setup-account", methods=["POST", "OPTIONS"])
 def setup_account():
-    
+    if request.method == "OPTIONS": return _build_cors_preflight_response()
     uid = get_user_id(request)
     if not uid: return jsonify({"error": "Unauthorized"}), 401
     
@@ -368,7 +374,7 @@ def setup_account():
 # ==========================================
 @app.route("/create-folder", methods=["POST", "OPTIONS"])
 def create_folder():
-    
+    if request.method == "OPTIONS": return _build_cors_preflight_response()
     uid = get_user_id(request)
     if not uid: return jsonify({"error": "Unauthorized"}), 401
     
@@ -406,7 +412,7 @@ def create_folder():
 # ==========================================
 @app.route("/analyze-master", methods=["POST", "OPTIONS"])
 def analyze_master():
-    
+    if request.method == "OPTIONS": return _build_cors_preflight_response()
     uid = get_user_id(request)
     if not uid: return jsonify({"error": "Unauthorized"}), 401
     
@@ -462,7 +468,7 @@ def analyze_master():
 # ==========================================
 @app.route("/confirm-kpis", methods=["POST", "OPTIONS"])
 def confirm_kpis():
-    
+    if request.method == "OPTIONS": return _build_cors_preflight_response()
     uid = get_user_id(request)
     if not uid: return jsonify({"error": "Unauthorized"}), 401
     
@@ -510,7 +516,7 @@ def confirm_kpis():
 # ==========================================
 @app.route("/get-kpis", methods=["GET", "OPTIONS"])
 def get_kpis():
-    
+    if request.method == "OPTIONS": return _build_cors_preflight_response()
     uid = get_user_id(request)
     if not uid: return jsonify({"error": "Unauthorized"}), 401
     
@@ -589,7 +595,7 @@ def get_kpis():
 # ==========================================
 @app.route("/upload-batch-file", methods=["POST", "OPTIONS"])
 def upload_batch_file():
-    
+    if request.method == "OPTIONS": return _build_cors_preflight_response()
     
     uid = get_user_id(request)
     user_email = get_user_email(request)
@@ -649,7 +655,7 @@ def upload_batch_file():
 # ==========================================
 @app.route("/", methods=["POST", "OPTIONS"])
 def gcs_trigger_handler():
-    
+    if request.method == "OPTIONS": return _build_cors_preflight_response()
     
     payload = request.get_json(silent=True) or {}
     data = payload.get("data", payload)
@@ -757,7 +763,7 @@ def gcs_trigger_handler():
 # ==========================================
 @app.route("/get-results", methods=["GET", "OPTIONS"])
 def get_results():
-    
+    if request.method == "OPTIONS": return _build_cors_preflight_response()
     uid = get_user_id(request)
     if not uid: return jsonify({"error": "Unauthorized"}), 401
     
@@ -811,5 +817,3 @@ def get_results():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
-
-
