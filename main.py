@@ -888,12 +888,12 @@ def gcs_trigger_handler():
                     "confidence": similarity.get("confidence", 0)
                 }), 200
 
- # ------------------------------------------
-# 📤 KPI extraction prompt (FIXED)
-# ------------------------------------------
-kpi_list = "\n".join([f"- {k}" for k in kpis])
+        # ------------------------------------------
+        # 📤 KPI extraction prompt (FIXED)
+        # ------------------------------------------
+        kpi_list = "\n".join([f"- {k}" for k in kpis])
 
-prompt = f"""
+        prompt = f"""
 You are a professional document data extraction engine.
 
 Extract values for ALL of the following fields:
@@ -913,6 +913,7 @@ RULES (STRICT):
 Return ONLY valid JSON:
 {{ "field_name": "value" }}
 """
+
 
 
         # ------------------------------------------
@@ -1062,6 +1063,7 @@ def get_results():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
 
