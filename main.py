@@ -643,7 +643,7 @@ def get_kpis():
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 📤 6. UPLOAD BATCH FILE (for shared users)
+# 📤 6. UPLOAD BATCH FILE (owners + shared users)
 # ==========================================
 @app.route("/upload-batch-file", methods=["POST", "OPTIONS"])
 def upload_batch_file():
@@ -666,31 +666,70 @@ def upload_batch_file():
         if not file.filename.lower().endswith('.pdf'):
             return jsonify({"error": "Only PDF files are allowed"}), 400
 
-        sanitized_email = re.sub(r'[@.]', '_', user_email)
-        share_doc_id = f"{owner_id}_{folder_id}_{sanitized_email}"
+        # ---- PERMISSION CHECK ----
+        is_owner = (uid == owner_id)
 
-        share_ref = db.collection("shares").document(share_doc_id).get()
+        if not is_owner:
+            sanitized_email = re.sub(r'[@.]', '_', user_email)
+            share_doc_id = f"{owner_id}_{folder_id}_{sanitized_email}"
+            share_ref = db.collection("shares").document(share_doc_id).get()
 
-        if not share_ref.exists:
-            return jsonify({"error": "Share not found. You do not have access to this folder."}), 403
+            if not share_ref.exists:
+                return jsonify({"error": "Share not found. You do not have access to this folder."}), 403
 
-        share_data = share_ref.to_dict()
-        permission = share_data.get("permission", "view")
+            share_data = share_ref.to_dict()
+            permission = share_data.get("permission", "view")
 
-        if permission != "edit":
-            return jsonify({"error": "You have view-only access. Upload not permitted."}), 403
+            if permission != "edit":
+                return jsonify({"error": "You have view-only access. Upload not permitted."}), 403
 
         original_filename = file.filename or "unnamed.pdf"
         sanitized_filename = re.sub(r'[^a-zA-Z0-9_.-]', '_', original_filename)
 
+        # ---- SEMANTIC VALIDATION ----
+        folder_ref = (
+            db.collection("tenants")
+            .document(owner_id)
+            .collection("folders")
+            .document(folder_id)
+            .get()
+        )
+
+        if folder_ref.exists:
+            folder_data = folder_ref.to_dict()
+            master_intent_profile = folder_data.get("master_intent_profile")
+            context_hint = folder_data.get("context_hint", "")
+
+            if master_intent_profile:
+                pdf_bytes = file.read()
+                file.seek(0)  # Reset pointer for upload
+
+                similarity = validate_document_semantic_similarity(
+                    pdf_bytes=pdf_bytes,
+                    master_intent_profile=master_intent_profile,
+                    context_hint=context_hint
+                )
+
+                if (
+                    not similarity.get("is_similar")
+                    or similarity.get("confidence", 0) < 0.70
+                ):
+                    return jsonify({
+                        "status": "rejected",
+                        "reason": similarity.get("reason"),
+                        "confidence": similarity.get("confidence", 0)
+                    }), 200
+
+        # ---- UPLOAD TO STORAGE ----
         storage_path = f"incoming/{owner_id}/{folder_id}/batch/{sanitized_filename}"
         storage_client = storage.Client()
         bucket = storage_client.bucket(BUCKET_NAME)
         blob = bucket.blob(storage_path)
-        
+
         blob.upload_from_file(file, content_type="application/pdf")
 
-        print(f"✅ Shared user {user_email} uploaded {sanitized_filename} to {storage_path}")
+        who = "Owner" if is_owner else f"Shared user {user_email}"
+        print(f"✅ {who} uploaded {sanitized_filename} to {storage_path}")
 
         return jsonify({
             "success": True,
@@ -701,7 +740,8 @@ def upload_batch_file():
     except Exception as e:
         print(f"❌ Upload Batch File Error: {str(e)}")
         return jsonify({"error": str(e)}), 500
-# ==========================================
+
+
 # ==========================================
 # 🧠 SEMANTIC DOCUMENT SIMILARITY VALIDATOR
 # ==========================================
@@ -1016,4 +1056,5 @@ def get_results():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
